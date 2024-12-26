@@ -1,0 +1,37 @@
+# 忽略 Python 编译文件
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 忽略虚拟环境目录
+venv/
+env/
+
+# 忽略 IDE 配置文件
+.vscode/
+.idea/
+
+# 忽略本地配置文件
+.env
+*.env
+
+# 忽略构建和分发目录
+build/
+dist/
+*.egg-info/
+
+# 忽略日志文件
+*.log
+
+# 忽略系统文件
+.DS_Store
+Thumbs.db
+
+# ignore .ipynb file
+*.ipynb
+
+# ignore the input and output
+saves/
+data/
+github_projects/
