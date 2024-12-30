@@ -6,19 +6,15 @@ import logging
 import argparse
 import json
 import numpy as np
-from colorama import Fore
 from tqdm import tqdm
 from fastbm25 import fastbm25
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 from torch.utils.data import DataLoader, Dataset, RandomSampler
-from transformers import (AdamW, get_linear_schedule_with_warmup, PreTrainedTokenizer)
-from transformers.generation.stopping_criteria import StoppingCriteriaList
+from transformers import (AdamW, get_linear_schedule_with_warmup, PreTrainedTokenizer, PreTrainedModel)
 
-from util import (load_train_and_valid_dataset, load_test_dataset,
-                  label_line, CodeBlock, split_into_smaller_blocks, split_word, 
-                  get_NL_list, StopAtSpecificTokenCriteria)
-from eval import evaluate
-from model import (build_model)
+from utils.util import (load_dataset, CodeBlock, split_into_smaller_blocks, Example)
+from model import (build_model, generate)
+from eval import compute_metric_stmt
 
 logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                     datefmt = '%m/%d/%Y %H:%M:%S',
@@ -56,18 +52,6 @@ def convert_example_to_feature(prefix:str, suffix:str, middle:str, related_files
     
     corpus = [x.code_content for x in code_blocks]
     tokenized_corpus = [tokenizer.tokenize(doc) for doc in corpus]
-    # tokenized_corpus = []
-    # for code in corpus:
-    #     tokenized_corpus.append(tokenizer.tokenize(code))
-    # for code in corpus:
-    #     code_token = code.split()
-    #     tokens = []
-    #     for token in code_token:
-    #         tokens.extend(split_word(token))
-    #     tokenized_corpus.append(" ".join(tokens))
-    # if len(tokenized_corpus) == 0:
-    #     print([str(block) for block in related_files])
-    #     exit()
     bm25_model = fastbm25(tokenized_corpus)
     prefix_line = prefix.split("\n")
     # TODO: set the query_line as a hyperparameter
@@ -78,13 +62,8 @@ def convert_example_to_feature(prefix:str, suffix:str, middle:str, related_files
         suffix_line = suffix.split("\n")
         query += "\n" + "\n".join(suffix_line[:15-len(prefix_line)])
     query = tokenizer.tokenize(query)
-    # query_token = prefix.split()
-    # tokens = []
-    # for token in query_token:
-    #     tokens.extend(split_word(token))
     result = bm25_model.top_k_sentence(query, k=args.relevant_code_num)
     related_codes = [corpus[x[1]] for x in result if x[2] > 3]
-    # print(related_codes)
     if len(related_codes) > 0:
         related_tokenized_result = tokenizer(related_codes, add_special_tokens=False)
         
@@ -113,8 +92,6 @@ def convert_example_to_feature(prefix:str, suffix:str, middle:str, related_files
     
     input_ids = repo_content["input_ids"] + direct_content["input_ids"]
     attention_mask = repo_content["attention_mask"] + direct_content["attention_mask"]
-    # input_ids = [] + direct_content["input_ids"]
-    # attention_mask = [] + direct_content["attention_mask"]
     if do_generate:
         feature = InputFeatures(input_ids, attention_mask, None)
     else:
@@ -128,24 +105,6 @@ def convert_example_to_feature(prefix:str, suffix:str, middle:str, related_files
             print(len(middle_ids))
         assert len(feature.input_ids) == len(feature.target_ids) == args.max_input_length
     return feature
-
-# def convert_examples_to_features(examples:List[List[Tuple[str, str]]], tokenizer:PreTrainedTokenizer, args) -> List[InputFeatures]:
-#     features = []
-    
-#     for example in tqdm(examples):
-#         items = construct_data(example)
-#         if items is None:
-#             continue
-#         else:
-#             prefix, suffix, middle, related_files = items
-
-#         middle_tokenized_result = tokenizer(middle, add_special_tokens=False)
-#         if len(middle_tokenized_result["input_ids"]) > 50:
-#             continue
-#         feature = convert_example_to_feature(prefix, suffix, middle, related_files, tokenizer, False, args)
-        
-#         features.append(feature)
-#     return features
   
 
 class MyDataset(Dataset):
@@ -162,7 +121,20 @@ class MyDataset(Dataset):
 def DoNothingCollator(batch):
     return batch
 
-        
+def test(all_eval_examples:Dict[str, List[Example]], generator:PreTrainedModel, tokenizer:PreTrainedTokenizer, args, epoch:int):
+    for name, examples in all_eval_examples.items():
+        print("Evaluating on {} dataset".format(name))
+        generations = generate(args, generator, tokenizer, examples)
+        if os.path.exists(f"{args.output_dir}/result_{epoch}/{name}") is False:
+            os.makedirs(f"{args.output_dir}/result_{epoch}/{name}", exist_ok=True)
+        with open(f"{args.output_dir}/result_{epoch}/{name}/prediction.jsonl", "w", encoding="utf-8") as f_pred:
+            for example, generation in zip(examples, generations):
+                f_pred.write(json.dumps({"task_id": example.task_id, "pred": generation}) + "\n")
+            if name == "cceval_python":
+                results = compute_metric_stmt(f"{args.output_dir}/result_{epoch}/{name}", "data/cceval/python/test.jsonl")
+            elif name == "repoeval_line":
+                results = compute_metric_stmt(f"{args.output_dir}/result_{epoch}/{name}", "data/repoeval/line_level/test.jsonl")
+        print(f"{name} epoch {epoch}: {str(results)}")
 def main():
     parser = argparse.ArgumentParser()
 
@@ -178,6 +150,8 @@ def main():
     parser.add_argument("--do_train", action='store_true',
                         help="Whether to run training.")
     parser.add_argument("--do_valid", action='store_true',
+                        help="Whether to run validation.")
+    parser.add_argument("--do_test", action='store_true',
                         help="Whether to run validation.")
     
     parser.add_argument("--train_batch_size", default=8, type=int,
@@ -207,6 +181,8 @@ def main():
                         help="Total number of relevant code blocks to use")
     parser.add_argument('--max_input_length', default=1024, type=int,
                         help="Max token num for input feature")
+    parser.add_argument('--max_generation_length', default=30, type=int,
+                        help="Max token num for generating when evaluate")
     
     # print arguments
     args = parser.parse_args()
@@ -237,6 +213,7 @@ def main():
 
     # build model
     generator, tokenizer = build_model(args)
+    all_eval_examples = None
     
     logger.info("Training/evaluation parameters %s", args)
     generator.to(args.device)  
@@ -244,18 +221,15 @@ def main():
         generator = torch.nn.DataParallel(generator)
     
     if args.do_train:
-        # Prepare training data loader
-        # train_examples, valid_examples = load_train_and_valid_dataset(args.train_filename)
-        # train_features = convert_examples_to_features(train_examples, tokenizer)
-        data = load_test_dataset(args, args.train_filename)
+        data = load_dataset(args.train_filename)
         train_data = data[:int(len(data)*0.9)]
         valid_data = data[int(len(data)*0.9):]
         train_features = []
-        for items in tqdm(train_data):
-            train_features.append(convert_example_to_feature(items[0], items[1], items[2], items[3], tokenizer, False, args))
+        for example in tqdm(train_data):
+            train_features.append(convert_example_to_feature(example.prefix, example.suffix, example.middle, example.relevant_code, tokenizer, False, args))
         valid_features = []
-        for items in tqdm(valid_data):
-            valid_features.append(convert_example_to_feature(items[0], items[1], items[2], items[3], tokenizer, False, args))
+        for example in tqdm(valid_data):
+            valid_features.append(convert_example_to_feature(example.prefix, example.suffix, example.middle, example.relevant_code, tokenizer, False, args))
         train_dataset = MyDataset(train_features)
         train_sampler = RandomSampler(train_dataset)
         train_dataloader = DataLoader(train_dataset, sampler=train_sampler, 
@@ -281,113 +255,49 @@ def main():
         logger.info("  Num epoch = %d", args.num_train_epochs)
         
         losses = []
-        all_eval_examples = None
         
         for epoch in range(args.num_train_epochs):
-            # for batch in train_dataloader:
-            #     generator.train()
+            for batch in train_dataloader:
+                generator.train()
                 
-            #     # Cat the ids of code, relevant document to form the final input
-            #     inputs = [feature.input_ids for feature in batch]
-            #     outputs = [feature.target_ids for feature in batch]
-            #     inputs = torch.tensor(inputs, dtype=torch.long).to(device)
-            #     outputs = torch.tensor(outputs, dtype=torch.long).to(device)
-            #     source_mask = inputs.ne(tokenizer.pad_token_id)
-            #     results = generator(input_ids=inputs, 
-            #                         attention_mask=source_mask,
-            #                         labels=outputs)
-            #     loss = results.loss
+                # Cat the ids of code, relevant document to form the final input
+                inputs = [feature.input_ids for feature in batch]
+                outputs = [feature.target_ids for feature in batch]
+                inputs = torch.tensor(inputs, dtype=torch.long).to(device)
+                outputs = torch.tensor(outputs, dtype=torch.long).to(device)
+                source_mask = inputs.ne(tokenizer.pad_token_id)
+                results = generator(input_ids=inputs, 
+                                    attention_mask=source_mask,
+                                    labels=outputs)
+                loss = results.loss
                 
-            #     if args.n_gpu > 1:
-            #         loss = loss.mean()
-            #     if args.gradient_accumulation_steps > 1:
-            #         loss = loss / args.gradient_accumulation_steps
-            #     losses.append(loss.item())
-            #     loss.backward()
-            #     if len(losses) % args.gradient_accumulation_steps == 0:
-            #         # Update parameters
-            #         optimizer.step()
-            #         optimizer.zero_grad()
-            #         scheduler.step()
-            #         if len(losses) // args.gradient_accumulation_steps % 100 == 0:
-            #             logger.info("epoch {} step {} loss {}".format(epoch,
-            #                                          len(losses)//args.gradient_accumulation_steps,
-            #                                          round(np.mean(losses[-100*args.gradient_accumulation_steps:]),4)))
+                if args.n_gpu > 1:
+                    loss = loss.mean()
+                if args.gradient_accumulation_steps > 1:
+                    loss = loss / args.gradient_accumulation_steps
+                losses.append(loss.item())
+                loss.backward()
+                if len(losses) % args.gradient_accumulation_steps == 0:
+                    # Update parameters
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    scheduler.step()
+                    if len(losses) // args.gradient_accumulation_steps % 100 == 0:
+                        logger.info("epoch {} step {} loss {}".format(epoch,
+                                                     len(losses)//args.gradient_accumulation_steps,
+                                                     round(np.mean(losses[-100*args.gradient_accumulation_steps:]),4)))
         
-            if args.do_valid:
-                
-                if all_eval_examples is None:
-                    # first time to do valid
-                    
-                    all_eval_examples = {
-                        "github_eval": valid_data,
-                        "cceval_python": load_test_dataset(args, "data/cceval/python/test.parquet"),
-                    }
-                    
-                    stopping_criteria = StoppingCriteriaList()
-                    NL_list = get_NL_list(tokenizer)
-                    stopping_criteria.append(StopAtSpecificTokenCriteria(NL_list))
-                
-                for name, examples in all_eval_examples.items():
-                    print("Evaluating on {} dataset".format(name))
-                    references, predictions = [], []
-                    with torch.no_grad():
-                        generator.eval()
-                        for example in tqdm(examples):
-                            # if name == "cceval_python":
-                            prefix = example[0]
-                            suffix = example[1]
-                            references.append(example[2])
-                            related_files = example[3]
-                            # elif name == "github_eval":
-                            #     items = construct_data(example)
-                            #     if items is None:
-                            #         continue
-                            #     else:
-                            #         prefix, suffix, middle, related_files = items
-                            #         references.append(middle)
-                            
-                            output_text = '\n'
-                            generated_code = ''
-                            stack = []
-                            max_try = 3
-                            # 当模型只输出空白行，或者输出内容没能闭包时，继续输出
-                            while (output_text == '\n' or len(stack) > 0) and max_try > 0:
-                                max_try -= 1
-                                prefix = prefix + generated_code
-                                feature:InputFeatures = convert_example_to_feature(prefix, suffix, "", related_files, tokenizer, True, args)
-                                generated_ids = generator.generate(input_ids=torch.tensor([feature.input_ids]).to(generator.device), attention_mask=torch.tensor([feature.attention_mask]).to(generator.device), max_new_tokens=50, do_sample=False, \
-                                                                stopping_criteria=stopping_criteria, pad_token_id=tokenizer.eos_token_id)
-                                output_text = tokenizer.decode(generated_ids[0][len(feature.input_ids):], skip_special_tokens=True)
-                                for c in output_text:
-                                    if c == '{' or c == '[' or c == '(':
-                                        stack.append(c)
-                                    elif c == '}' or c == ']' or c== ')':
-                                        # 有可能 {, [, ( 来自prefix
-                                        if len(stack) > 0:
-                                            last_c = stack.pop()
-                                            match_c = last_c + c
-                                            if match_c == "{}" or match_c == "[]" or match_c == "()":
-                                                continue
-                                            else:
-                                                stack = []
-                                                break
-                                generated_code += output_text
-                            
-                            
-                            
-                            predictions.append(generated_code)
-                        generator.train()
-                    
-                    edit_similarity, exact_match = evaluate(references, predictions)
-                    print("{} dataset: edit_similarity: {}%, exact_match: {}%".format(name, edit_similarity*100, exact_match*100))
-                    with open(os.path.join(args.output_dir, f"{epoch}-{name}.jsonl"), 'w') as f:
-                        for ref, pre in zip(references, predictions):
-                            js = {
-                                "reference":ref,
-                                "prediction":pre
-                            }
-                            f.write(json.dumps(js)+'\n')
+    if args.do_test:
+        
+        if all_eval_examples is None:
+            # first time to do valid
+            
+            all_eval_examples = {
+                "cceval_python": load_dataset("cceval_python"),
+                "repoeval_line": load_dataset("repoeval_line")
+            }
+        
+        test(all_eval_examples, generator, tokenizer, args, 0 if not args.do_train else epoch)
                 
 if __name__ == '__main__':
     main()  

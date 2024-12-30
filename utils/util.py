@@ -3,10 +3,18 @@ import pandas as pd
 import tokenize
 import io
 import re
-from typing import Tuple, List
+from typing import Tuple, List, Union
 from torch import FloatTensor, LongTensor
 from transformers import AutoTokenizer
 from transformers.generation.stopping_criteria import StoppingCriteria
+
+class Example:
+    def __init__(self, task_id:str, prefix:str, suffix:str, middle:str, relevant_codes:List["CodeBlock"]) -> None:
+        self.task_id = task_id
+        self.prefix = prefix
+        self.suffix = suffix
+        self.middle = middle
+        self.relevant_code = relevant_codes
 
 def load_train_and_valid_dataset(dataset_path:str) -> Tuple[List[List[Tuple[str, str]]], List[List[Tuple[str, str]]]]:
     """
@@ -36,20 +44,30 @@ def load_train_and_valid_dataset(dataset_path:str) -> Tuple[List[List[Tuple[str,
 
     return training_datasets, validation_datasets
 
-def load_test_dataset(args, datasetname) -> List[Tuple[str, str, str, List["CodeBlock"]]]:
+def load_dataset(datasetname:str) -> List[Example]:
     """
     Loads a dataset.
-    :param args: Parameters containing various configurations.
     :param datasetname: The name of the dataset to load.
     :return: The loaded dataset.
     """
-    data_frame = pd.read_parquet(datasetname)
+    if datasetname == "cceval_python":
+        data_frame = pd.read_parquet("data/cceval/python/test.parquet")
+    elif datasetname == "repoeval_line":
+        data_frame_parts = []
+        data_frame_parts.append(pd.read_parquet("data/repoeval/line_level/test_0.parquet"))
+        data_frame_parts.append(pd.read_parquet("data/repoeval/line_level/test_1.parquet"))
+        data_frame = pd.concat(data_frame_parts)
+    else:
+        raise Exception("Unsupport dataset name")
 
     datasets = []
     for item in data_frame[["task_id", "path", "left_context", "right_context", "crossfile_context", "groundtruth"]].values:
         cross_files = item[4] if len(item[4]) > 0 else [{'path': "", "text": "Don't need cross file context for completion"}]
         cross_files = [CodeBlock(x["path"], x["text"]) for x in cross_files]
-        datasets.append((item[2], item[3], item[5], cross_files))
+        if datasetname == "repoeval_line":
+            datasets.append(Example(item[0], item[2]+"\n", item[3], item[5], cross_files))
+        else:
+            datasets.append(Example(item[0], item[2], item[3], item[5], cross_files))
     
     return datasets
 
@@ -211,3 +229,4 @@ def get_NL_list(tokenizer:AutoTokenizer) -> List[int]:
         if token.endswith("\n"):
             NL_list.append(id)
     return NL_list
+

@@ -2,43 +2,14 @@
 # Licensed under the MIT License. 
 import numpy as np
 import logging
-from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
+from tqdm import tqdm
+from transformers import AutoTokenizer, AutoModelForCausalLM, PreTrainedModel, PreTrainedTokenizer
 from transformers.generation.stopping_criteria import StoppingCriteriaList
-from typing import Tuple
+from torch.utils.data import DataLoader, Dataset, SequentialSampler
+from typing import Tuple, List, Dict
 
-        
-class DataBase(object):
-    def __init__(self, vector) -> None:
-        self.vector = vector
-        self.history = []
-        
-    def __len__(self):
-        return self.vector.shape[0]
-    
-    def search(self, query, number, stage=None):
-        scores = np.matmul(query, self.vector.T)
-        sort_ids = np.argsort(scores, axis=-1, kind='quicksort', order=None)[:,::-1]
-        
-        index = []
-        for i in range(len(sort_ids)):
-            if stage == "train":
-                index.append(sort_ids[i][1:number+1])
-            else:
-                index.append(sort_ids[i][0:number])
-        
-        if stage == "train":
-            self.history.append(index)
-                
-        return index
-    
-    def get_history(self):
-        temp = self.history
-        self.history = []
-        return temp
-    
-    def update(self, index, vectors):
-        for id, vector in zip(index, vectors):
-            self.vector[id] = vector
+from utils.util import Example
 
 logger = logging.getLogger(__name__)
 
@@ -60,3 +31,98 @@ def build_model(args) -> Tuple[AutoModelForCausalLM, AutoTokenizer]:
     logger.info("Finish loading generator [%s] from %s", get_model_size(generator), args.model_name_or_path)
 
     return generator, tokenizer
+
+class CustomDataset(Dataset):
+    """A dataset class for code generation
+
+    Args:
+        args: Configuration parameters.
+        tokenizer: Tokenizer.
+        examples: A collection of examples.
+        retrieved_codeblocks: Retrieved code blocks.
+    """
+    
+    def __init__(self, args, tokenizer, examples:List[Example]) -> None:
+        super().__init__()
+        self.args = args
+        self.tokenizer = tokenizer
+        self.examples = examples
+        self.special_tokens = {
+            "prefix_id": tokenizer.convert_tokens_to_ids("<PREFIX>"),
+            "suffix_id": tokenizer.convert_tokens_to_ids("<SUFFIX>"),
+            "middle_id": tokenizer.convert_tokens_to_ids("<MIDDLE>")
+        }
+        
+    def __len__(self):
+        return len(self.examples)
+    
+    def construct_prompt(self, example:Example):
+        '''
+        concatenate the context from other files with the context within the current file
+        '''
+        prefix = example.prefix
+        suffix = example.suffix
+        retrieved_codeblocks = example.relevant_code
+        
+        filter_codeblocks = []
+        for x in retrieved_codeblocks:
+            file_path = x.file_path
+            code_content = x.code_content
+            if file_path != "":
+                filter_codeblocks.append(f"#{file_path}\n{code_content}" if code_content.endswith("\n") else f"#{file_path}\n{code_content}\n")
+            else:
+                break
+        
+        prefix_tokenized_result = self.tokenizer(prefix, add_special_tokens=False)
+        suffix_tokenized_result = self.tokenizer(suffix, add_special_tokens=False)
+        related_tokenized_result = self.tokenizer(filter_codeblocks, add_special_tokens=False)
+        prefix_length = int(0.75 * self.args.max_input_length / 2)
+        suffix_length = int(0.75 * self.args.max_input_length - prefix_length)
+        prefix_ids = prefix_tokenized_result["input_ids"] if len(prefix_tokenized_result["input_ids"]) < prefix_length else prefix_tokenized_result["input_ids"][-prefix_length:]
+        suffix_ids = suffix_tokenized_result["input_ids"] if len(suffix_tokenized_result["input_ids"]) < suffix_length else suffix_tokenized_result["input_ids"][:suffix_length]
+        
+        direct_content = {
+            "input_ids": [self.special_tokens["suffix_id"]] + suffix_ids + [self.special_tokens["prefix_id"]] + prefix_ids + [self.special_tokens["middle_id"]],
+            "attention_mask": [1] * (len(prefix_ids) + len(suffix_ids) + 3)
+        }
+        
+        repo_content = {
+            "input_ids": [],
+            "attention_mask": []
+        }
+        left_budget = self.args.max_input_length - len(direct_content["input_ids"])
+        related_idx = 0
+        while related_idx < len(filter_codeblocks) and len(repo_content["input_ids"]) + len(related_tokenized_result["input_ids"][related_idx]) < left_budget:
+            repo_content["input_ids"].extend(related_tokenized_result["input_ids"][related_idx])
+            repo_content["attention_mask"].extend(related_tokenized_result["attention_mask"][related_idx])
+            related_idx += 1
+        
+        input_ids = repo_content["input_ids"] + direct_content["input_ids"]
+        attention_mask = repo_content["attention_mask"] + direct_content["attention_mask"]
+        padding_length = self.args.max_input_length - len(input_ids)
+        input_ids = [self.tokenizer.pad_token_id] * padding_length + input_ids
+        attention_mask = [0] * padding_length + attention_mask
+        return {
+            "input_ids":input_ids,
+            "attention_mask":attention_mask
+        }
+        
+    def __getitem__(self, index) -> Tuple[torch.Tensor, torch.Tensor]:
+        example = self.examples[index]
+        input_ids, attention_mask = self.construct_prompt(example).values()
+        return torch.tensor(input_ids), torch.tensor(attention_mask)
+
+def generate(args, generator:PreTrainedModel, tokenizer:PreTrainedTokenizer, examples:List[Example]) -> List[str]:
+    generated_codes = []
+    dataset = CustomDataset(args, tokenizer, examples)
+    sampler = SequentialSampler(dataset)
+    # TODO: set the num_workers as a hyperparameter
+    dataloader = DataLoader(dataset, sampler=sampler, batch_size=args.eval_batch_size, num_workers=20)
+    pbar = tqdm(dataloader, desc="Generating")
+    with torch.no_grad():
+        for batch in pbar:
+            input_ids, attention_mask = [x.to(generator.device) for x in batch]
+            generated_ids = generator.generate(input_ids, attention_mask=attention_mask, 
+                max_length=input_ids.size(1)+args.max_generation_length, pad_token_id=tokenizer.pad_token_id)
+            generated_codes.extend(generated_ids[:, input_ids.size(1):])
+    return [tokenizer.decode(generated_id, skip_special_tokens=True) for generated_id in generated_codes]

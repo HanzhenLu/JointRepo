@@ -7,7 +7,7 @@ from tqdm import tqdm
 from collections import deque
 from colorama import Back
 
-from util import label_line
+from utils.util import label_line
 
 def read_dir(dir:str) -> Dict[str, str]:
     content_map = {}
