@@ -2,12 +2,12 @@ import os
 import ast
 import random
 import pandas as pd
-from typing import Dict, List, Union, Set, Tuple
+from typing import Dict, List, Tuple
 from tqdm import tqdm
-from collections import deque
-from colorama import Back
+from transformers import AutoTokenizer
+from fastbm25 import fastbm25
 
-from utils.util import label_line
+from utils.util import label_line, split_into_smaller_blocks, CodeBlock
 
 def read_dir(dir:str) -> Dict[str, str]:
     content_map = {}
@@ -24,153 +24,30 @@ def read_dir(dir:str) -> Dict[str, str]:
             
     
     return content_map
-    
-def extract_imports(file_path:str, content: str) -> List:
-    tree = ast.parse(content, filename=file_path)
-    
-    imports = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                imports.append(alias.name)
-        elif isinstance(node, ast.ImportFrom):
-            if node.module:
-                imports.append(node.module)
-    
-    return imports
 
-class File:
-    def __init__(self, path:str, content:str) -> None:
-        self.path = path
-        self.content = content
-        self.dep_in = 0
-        self.dep_out_path: set = set()
-        self.dep_in_lib: set = set()
-        self.dep_in_path: set = set()
-        self.subgraph_idx: int = -1
+def construct_data(code_content:str) -> Tuple[str, str, str]:
+    try:
+        ast.parse(code_content)
+    except Exception:
+        return None
+    line_index_labels = label_line(code_content)
+    # if the selected file contains little content, we should drop it
+    raw_lines = code_content.split('\n')
+    raw_lines = [line+"\n" if i != len(raw_lines) - 1 else line for i, line in enumerate(raw_lines)]
+    valid_index = [r for r, v in line_index_labels if v]
     
-    # 方便打印出来查看内容
-    def __str__(self) -> str:
-        return "path:{}\ndep_in:{}\ndep_out_path:{}".format(self.path, self.dep_in, str(self.dep_out_path))
+    if len(valid_index) == 0:
+        return None
     
-    # 用于set
-    def __hash__(self) -> int:
-        return str(self).__hash__()
-
-def TopologicalSort(project:Dict[str, str]) -> Union[List[List[File]], None]:
-    graph: Dict[str, File] = {}
-    for path, content in project.items():
-        cur_file = File(path, content)
-        try:
-            imports = extract_imports(path, content)
-        except Exception as e:
-            # print(Back.RED + f"{path} : {e}")
-            # print(Back.BLACK + "")
-            return None
-            
-        for imp in imports:
-            cur_file.dep_in_lib.add(imp)
-        graph[path] = cur_file
+    inner_try_count = 0
     
-    # 根据依赖关系连接图中的各个节点
-    for key, value in graph.items():
-        for imp in value.dep_in_lib:
-            imp = imp.replace('.', '/')
-            for file in graph.keys():
-                if file.endswith(imp+"/__init__.py") or file.endswith(imp+".py"):
-                    graph[file].dep_out_path.add(key)
-                    graph[key].dep_in_path.add(file)
-                    graph[key].dep_in += 1
-    # 将整个图分为互不连通的子图
-    subgraphs: List[Set[File]] = []
-    for _, node in graph.items():
-        if node.subgraph_idx == -1:
-            subgraph = set()
-            subgraph.add(node)
-            idx = len(subgraphs)
-            node.subgraph_idx = idx
-            queue = deque()
-            
-            for file_path in node.dep_out_path:
-                queue.append(file_path)
-            for file_path in node.dep_in_path:
-                queue.append(file_path)
-            while queue:
-                element = queue.popleft()
-                element = graph[element]
-                if element.subgraph_idx == -1:
-                    subgraph.add(element)
-                    element.subgraph_idx = idx
-                    for file_path in node.dep_out_path:
-                        queue.append(file_path)
-                    for file_path in node.dep_in_path:
-                        queue.append(file_path)
-            subgraphs.append(subgraph)
-            
-    def find_min_in_node(subgraph: Set[File], results: List[File]) -> File:
-        min_in = 0
-        min_node = None
-        for node in subgraph:
-            if node not in results:
-                if min_node is None or node.dep_in < min_in:
-                    min_node = node
-                    min_in = node.dep_in
-        
-        return min_node
+    selected_line = None
+    while (selected_line is None or len(selected_line) > 200) and inner_try_count < 10:
+        selected_index = random.choice(valid_index[1:]) if len(valid_index) > 1 else valid_index[0]
+        selected_line = "".join([raw_lines[i] for i in selected_index])
+        inner_try_count += 1
     
-    # 将每个子图转化为一个字符串
-    all_results = []
-    for subgraph in subgraphs:
-        results = []
-        while len(results) != len(subgraph):
-            min_node = find_min_in_node(subgraph, results)
-            for out_file in min_node.dep_out_path:
-                graph[out_file].dep_in -= 1
-            results.append(min_node)
-        
-        all_results.append(results)
-        
-    return all_results
-
-def process_project(project_dict:Dict[str, str]) -> Union[List[List[File]], None]:
-    res = TopologicalSort(project_dict)
-    return res
-
-def construct_data(example:List[Tuple[str, str]]) -> Tuple[str, str, str, str, List[Dict[str, str]]]:
-    outer_try_count = 0
-    while outer_try_count < min(10, len(example) - 1):
-        # example:List[Tuple[str, str]]
-        # the later tuple relies on the former tuple
-        # so we shouldn't choose the first tuple
-        selected_file = random.choice(example[1:])
-        line_index_labels = label_line(selected_file[1])
-        # if the selected file contains little content, we should drop it
-        if len(line_index_labels) < 10:
-            outer_try_count += 1
-            continue
-        raw_lines = selected_file[1].split('\n')
-        raw_lines = [line+"\n" if i != len(raw_lines) - 1 else line for i, line in enumerate(raw_lines)]
-        valid_index = [r for r, v in line_index_labels if v]
-        
-        if len(valid_index) == 0:
-            outer_try_count += 1
-            continue
-        
-        inner_try_count = 0
-        
-        selected_line = None
-        while (selected_line is None or len(selected_line) > 200) and inner_try_count < 10:
-            selected_index = random.choice(valid_index[1:]) if len(valid_index) > 1 else valid_index[0]
-            selected_line = "".join([raw_lines[i] for i in selected_index])
-            inner_try_count += 1
-        
-        if inner_try_count == 10:
-            outer_try_count += 1
-            continue
-        else:
-            break
-    
-    if outer_try_count == min(10, len(example) - 1):
+    if inner_try_count == 10 or selected_line is None:
         return None
     
     prefix = "".join([raw_lines[i] for i in range(0, selected_index[0])]) if selected_index[0] > 0 else ""
@@ -182,43 +59,81 @@ def construct_data(example:List[Tuple[str, str]]) -> Tuple[str, str, str, str, L
         prefix += selected_line[:split_point]
         middle = selected_line[split_point:]
     
-    related_files = [{"path":x[0], "text":x[1]} for x in example if x[0] != selected_file[0]]
     
-    return selected_file[0], prefix, suffix, middle, related_files
+    return prefix, suffix, middle
 
 if __name__ == "__main__":
+    
+    tokenizer = AutoTokenizer.from_pretrained("/data/hanzhenlu/LLaMA-Factory/saves/llama_100m_SPM_pretrained_sft_v4")
+    
     root = "github_projects"
     repo_names = os.listdir(root)
-    repo_dict = {}
+    repo_dict:Dict[str, Dict[str, str]] = {}
     for repo_name in repo_names:
         repo_dict[repo_name] = read_dir(os.path.join(root, repo_name))
 
-    samples = []
-    for repo_name, file_content_map in tqdm(repo_dict.items()):
-        # print(Back.GREEN + f"begin {repo_name}", end="")
-        # print(Back.BLACK + "\n")
-        result = process_project(file_content_map)
-        if result is not None:
-            samples.append(result)
-        
     dataframe = {"task_id":[], "path":[], "left_context":[], "right_context":[], "crossfile_context":[], "groundtruth":[]}
-    for repo_sample in samples:
-        for cluster in repo_sample:
-            cluster:List[File]
-            example = []
-            for file in cluster:
-                example.append((file.path, file.content))
+    for repo_name, file_content_map in tqdm(repo_dict.items()):
+        file_names = file_content_map.keys()
+        if len(file_names) == 0:
+            continue
+        count = 0
+        samples = []
+        
+        code_blocks:List[CodeBlock] = []
+        for path, text in file_content_map.items():
+            file = CodeBlock(path, text)
+            code_blocks.extend(split_into_smaller_blocks(file, False))
+            
+        corpus = [x.code_content for x in code_blocks]
+        tokenized_corpus = [tokenizer.tokenize(doc) for doc in corpus]
+        bm25_model = fastbm25(tokenized_corpus)
+        
+        for file_name in file_names:
+            result = construct_data(file_content_map[file_name])
+            if result is not None:
+                prefix, suffix, middle = result
+                sample = {}
+                sample["path"] = file_name
+                sample["left_context"] = prefix
+                sample["right_context"] = suffix
+                sample["groundtruth"] = middle
                 
-            item = construct_data(example)
-            if item is not None:
-                dataframe["task_id"].append(item[0])
-                dataframe["path"].append(item[0])
-                dataframe["left_context"].append(item[1])
-                dataframe["right_context"].append(item[2])
-                dataframe["crossfile_context"].append(item[4])
-                dataframe["groundtruth"].append(item[3])
+                prefix_line = prefix.split("\n")
+                if len(prefix_line) >= 15:
+                    query = "\n".join(prefix_line[-15:])
+                else:
+                    query = "\n".join(prefix_line)
+                    suffix_line = suffix.split("\n")
+                    query += "\n" + "\n".join(suffix_line[:15-len(prefix_line)])
+                query = tokenizer.tokenize(query)
+                result = bm25_model.top_k_sentence(query, k=50)
+                related_codes = [code_blocks[x[1]] for x in result if code_blocks[x[1]].file_path != file_name]
+                
+                sample["crossfile_context"] = [
+                    {
+                        "path": x.file_path,
+                        "text": x.code_content
+                    } for x in related_codes
+                ]
+                
+            samples.append(sample)
+        
+        if len(samples) > 200:
+            selected_samples = random.choices(samples, k=200)
+        else:
+            selected_samples = samples
+        
+        for sample in selected_samples:
+            count += 1
+            dataframe["crossfile_context"].append(sample["crossfile_context"])
+            dataframe["groundtruth"].append(sample["groundtruth"])
+            dataframe["left_context"].append(sample["left_context"])
+            dataframe["path"].append(sample["path"])
+            dataframe["right_context"].append(sample["right_context"])
+            dataframe["task_id"].append(f"{repo_name}/{count}")
     
     dataframe = pd.DataFrame.from_dict(dataframe)
     if not os.path.exists("data/github_projects/python"):
         os.makedirs("data/github_projects/python")
-    dataframe.to_parquet("data/github_projects/python/train.parquet")
+    dataframe.to_json("data/github_projects/python/train.json")

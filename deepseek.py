@@ -10,10 +10,10 @@ from tqdm import tqdm
 from fastbm25 import fastbm25
 from typing import List, Tuple, Dict
 from torch.utils.data import DataLoader, Dataset, SequentialSampler
-from transformers import (AdamW, get_linear_schedule_with_warmup, PreTrainedTokenizer, PreTrainedModel)
+from transformers import (PreTrainedTokenizer, PreTrainedModel)
 
 from utils.util import (load_dataset, CodeBlock, split_into_smaller_blocks, Example)
-from model import (build_model)
+from model import build_model
 from eval import compute_metric_stmt
 
 logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
@@ -104,35 +104,38 @@ class CustomDataset(Dataset):
         if len(filter_codeblocks) > 0:
             related_tokenized_result = self.tokenizer(filter_codeblocks, add_special_tokens=False)
         
-        prefix_length = int(0.75 * self.args.max_input_length / 2)
-        suffix_length = int(0.75 * self.args.max_input_length - prefix_length)
-        prefix_ids = prefix_tokenized_result["input_ids"] if len(prefix_tokenized_result["input_ids"]) < prefix_length else prefix_tokenized_result["input_ids"][-prefix_length:]
-        suffix_ids = suffix_tokenized_result["input_ids"] if len(suffix_tokenized_result["input_ids"]) < suffix_length else suffix_tokenized_result["input_ids"][:suffix_length]
-        
-        direct_content = {
-            # prefix id 放在哪需要进一步测试
-            "input_ids": prefix_ids + [self.special_tokens["middle_id"]] + suffix_ids + [self.special_tokens["suffix_id"]],
-            "attention_mask": [1] * (len(prefix_ids) + len(suffix_ids) + 3)
-        }
+        # TODO: set the cross_file_budget as a hyperparameter
+        cross_file_budget = int(0.25 * self.args.max_input_length)
         
         repo_content = {
             "input_ids": [],
             "attention_mask": []
         }
-        left_budget = self.args.max_input_length - len(direct_content["attention_mask"]) - 1
         related_idx = 0
-        while related_idx < len(filter_codeblocks) and len(repo_content["attention_mask"]) + len(related_tokenized_result["input_ids"][related_idx]) < left_budget:
+        while related_idx < len(filter_codeblocks) and len(repo_content["attention_mask"]) + len(related_tokenized_result["input_ids"][related_idx]) < cross_file_budget:
             repo_content["input_ids"].extend(related_tokenized_result["input_ids"][related_idx])
             repo_content["attention_mask"].extend(related_tokenized_result["attention_mask"][related_idx])
             related_idx += 1
         
-        input_ids = [32013] + [self.special_tokens["prefix_id"]] + repo_content["input_ids"] + direct_content["input_ids"]
+        left_budget = self.args.max_input_length - len(repo_content["input_ids"]) - 4
+        prefix_length = int(left_budget / 2)
+        suffix_length = int(left_budget - prefix_length)
+        prefix_ids = prefix_tokenized_result["input_ids"] if len(prefix_tokenized_result["input_ids"]) < prefix_length else prefix_tokenized_result["input_ids"][-prefix_length:]
+        suffix_ids = suffix_tokenized_result["input_ids"] if len(suffix_tokenized_result["input_ids"]) < suffix_length else suffix_tokenized_result["input_ids"][:suffix_length]
+        
+        direct_content = {
+            # TODO: prefix id 放在哪需要进一步测试
+            "input_ids": [self.special_tokens["prefix_id"]] + prefix_ids + [self.special_tokens["middle_id"]] + suffix_ids + [self.special_tokens["suffix_id"]],
+            "attention_mask": [1] * (len(prefix_ids) + len(suffix_ids) + 3)
+        } 
+        
+        input_ids = [32013] + repo_content["input_ids"] + direct_content["input_ids"]
         attention_mask = [1] + repo_content["attention_mask"] + direct_content["attention_mask"]
         padding_length = self.args.max_input_length - len(input_ids)
         input_ids = [self.tokenizer.pad_token_id] * padding_length + input_ids
         attention_mask = [0] * padding_length + attention_mask
         
-        assert len(input_ids) == len(attention_mask)
+        assert len(input_ids) == len(attention_mask) == self.args.max_input_length
         
         return {
             "input_ids":input_ids,

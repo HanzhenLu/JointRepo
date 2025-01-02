@@ -8,8 +8,9 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, PreTrainedModel, P
 from transformers.generation.stopping_criteria import StoppingCriteriaList
 from torch.utils.data import DataLoader, Dataset, SequentialSampler
 from typing import Tuple, List, Dict
+from fastbm25 import fastbm25
 
-from utils.util import Example
+from utils.util import Example, split_into_smaller_blocks, CodeBlock
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +63,24 @@ class CustomDataset(Dataset):
         '''
         prefix = example.prefix
         suffix = example.suffix
-        retrieved_codeblocks = example.relevant_code
+        
+        code_blocks:List[CodeBlock] = []
+        for file in example.relevant_code:
+            code_blocks.extend(split_into_smaller_blocks(file, self.args.enable_fixed_block))
+            
+        tokenized_corpus = [self.tokenizer.tokenize(doc.code_content) for doc in code_blocks]
+        bm25_model = fastbm25(tokenized_corpus)
+        prefix_line = prefix.split("\n")
+        # TODO: set the query_line as a hyperparameter
+        if len(prefix_line) >= 15:
+            query = "\n".join(prefix_line[-15:])
+        else:
+            query = "\n".join(prefix_line)
+            suffix_line = suffix.split("\n")
+            query += "\n" + "\n".join(suffix_line[:15-len(prefix_line)])
+        query = self.tokenizer.tokenize(query)
+        result = bm25_model.top_k_sentence(query, k=self.args.relevant_code_num)
+        retrieved_codeblocks = [code_blocks[x[1]] for x in result]
         
         filter_codeblocks = []
         for x in retrieved_codeblocks:
@@ -75,9 +93,24 @@ class CustomDataset(Dataset):
         
         prefix_tokenized_result = self.tokenizer(prefix, add_special_tokens=False)
         suffix_tokenized_result = self.tokenizer(suffix, add_special_tokens=False)
-        related_tokenized_result = self.tokenizer(filter_codeblocks, add_special_tokens=False)
-        prefix_length = int(0.75 * self.args.max_input_length / 2)
-        suffix_length = int(0.75 * self.args.max_input_length - prefix_length)
+        if len(filter_codeblocks) > 0:
+            related_tokenized_result = self.tokenizer(filter_codeblocks, add_special_tokens=False)
+            
+        # TODO: set the cross_file_budget as a hyperparameter
+        cross_file_budget = int(0.25 * self.args.max_input_length)
+        repo_content = {
+            "input_ids": [],
+            "attention_mask": []
+        }
+        related_idx = 0
+        while related_idx < len(filter_codeblocks) and len(repo_content["input_ids"]) + len(related_tokenized_result["input_ids"][related_idx]) < cross_file_budget:
+            repo_content["input_ids"].extend(related_tokenized_result["input_ids"][related_idx])
+            repo_content["attention_mask"].extend(related_tokenized_result["attention_mask"][related_idx])
+            related_idx += 1
+        
+        left_budget = self.args.max_input_length - len(repo_content["input_ids"]) - 3
+        prefix_length = int(left_budget / 2)
+        suffix_length = int(left_budget - prefix_length)
         prefix_ids = prefix_tokenized_result["input_ids"] if len(prefix_tokenized_result["input_ids"]) < prefix_length else prefix_tokenized_result["input_ids"][-prefix_length:]
         suffix_ids = suffix_tokenized_result["input_ids"] if len(suffix_tokenized_result["input_ids"]) < suffix_length else suffix_tokenized_result["input_ids"][:suffix_length]
         
@@ -85,17 +118,6 @@ class CustomDataset(Dataset):
             "input_ids": [self.special_tokens["suffix_id"]] + suffix_ids + [self.special_tokens["prefix_id"]] + prefix_ids + [self.special_tokens["middle_id"]],
             "attention_mask": [1] * (len(prefix_ids) + len(suffix_ids) + 3)
         }
-        
-        repo_content = {
-            "input_ids": [],
-            "attention_mask": []
-        }
-        left_budget = self.args.max_input_length - len(direct_content["input_ids"])
-        related_idx = 0
-        while related_idx < len(filter_codeblocks) and len(repo_content["input_ids"]) + len(related_tokenized_result["input_ids"][related_idx]) < left_budget:
-            repo_content["input_ids"].extend(related_tokenized_result["input_ids"][related_idx])
-            repo_content["attention_mask"].extend(related_tokenized_result["attention_mask"][related_idx])
-            related_idx += 1
         
         input_ids = repo_content["input_ids"] + direct_content["input_ids"]
         attention_mask = repo_content["attention_mask"] + direct_content["attention_mask"]
@@ -117,7 +139,7 @@ def generate(args, generator:PreTrainedModel, tokenizer:PreTrainedTokenizer, exa
     dataset = CustomDataset(args, tokenizer, examples)
     sampler = SequentialSampler(dataset)
     # TODO: set the num_workers as a hyperparameter
-    dataloader = DataLoader(dataset, sampler=sampler, batch_size=args.eval_batch_size, num_workers=20)
+    dataloader = DataLoader(dataset, sampler=sampler, batch_size=args.eval_batch_size)
     pbar = tqdm(dataloader, desc="Generating")
     with torch.no_grad():
         for batch in pbar:

@@ -7,12 +7,11 @@ import argparse
 import json
 import numpy as np
 from tqdm import tqdm
-from fastbm25 import fastbm25
 from typing import List, Tuple, Dict
 from torch.utils.data import DataLoader, Dataset, RandomSampler
 from transformers import (AdamW, get_linear_schedule_with_warmup, PreTrainedTokenizer, PreTrainedModel)
 
-from utils.util import (load_dataset, CodeBlock, split_into_smaller_blocks, Example)
+from utils.util import (load_dataset, CodeBlock, split_into_smaller_blocks, Example, bm25_retrieve)
 from model import (build_model, generate)
 from eval import compute_metric_stmt
 
@@ -41,7 +40,7 @@ class InputFeatures(object):
         self.attention_mask = attention_mask
         self.target_ids = target_ids
         
-def convert_example_to_feature(prefix:str, suffix:str, middle:str, related_files:List[CodeBlock], tokenizer:PreTrainedTokenizer, do_generate:bool, args) -> InputFeatures:
+def convert_example_to_feature(prefix:str, suffix:str, middle:str, related_files:List[CodeBlock], tokenizer:PreTrainedTokenizer, args) -> InputFeatures:
     prefix_id = tokenizer.convert_tokens_to_ids("<PREFIX>")
     suffix_id = tokenizer.convert_tokens_to_ids("<SUFFIX>")
     middle_id = tokenizer.convert_tokens_to_ids("<MIDDLE>")
@@ -50,28 +49,49 @@ def convert_example_to_feature(prefix:str, suffix:str, middle:str, related_files
     for file in related_files:
         code_blocks.extend(split_into_smaller_blocks(file, args.enable_fixed_block))
     
-    corpus = [x.code_content for x in code_blocks]
-    tokenized_corpus = [tokenizer.tokenize(doc) for doc in corpus]
-    bm25_model = fastbm25(tokenized_corpus)
+    candidate_str = [x.code_content for x in code_blocks]
     prefix_line = prefix.split("\n")
     # TODO: set the query_line as a hyperparameter
     if len(prefix_line) >= 15:
-        query = "\n".join(prefix_line[-15:])
+        query_str = "\n".join(prefix_line[-15:])
     else:
-        query = "\n".join(prefix_line)
+        query_str = "\n".join(prefix_line)
         suffix_line = suffix.split("\n")
-        query += "\n" + "\n".join(suffix_line[:15-len(prefix_line)])
-    query = tokenizer.tokenize(query)
-    result = bm25_model.top_k_sentence(query, k=args.relevant_code_num)
-    related_codes = [corpus[x[1]] for x in result if x[2] > 3]
+        query_str += "\n" + "\n".join(suffix_line[:15-len(prefix_line)])
+    result = bm25_retrieve(query_str, candidate_str, k=args.relevant_code_num)
+    
+    related_codes = [code_blocks[x[1]] for x in result]
+    filter_codeblocks = []
+    for x in related_codes:
+        file_path = x.file_path
+        code_content = x.code_content
+        if file_path != "":
+            filter_codeblocks.append(f"#{file_path}\n{code_content}" if code_content.endswith("\n") else f"#{file_path}\n{code_content}\n")
+        else:
+            break
+    
     if len(related_codes) > 0:
-        related_tokenized_result = tokenizer(related_codes, add_special_tokens=False)
+        related_tokenized_result = tokenizer(filter_codeblocks, add_special_tokens=False)
         
     prefix_tokenized_result = tokenizer(prefix, add_special_tokens=False)
     suffix_tokenized_result = tokenizer(suffix, add_special_tokens=False)
     middle_tokenized_result = tokenizer(middle, add_special_tokens=False)
-    prefix_length = int(0.75 * args.max_input_length / 2)
-    suffix_length = int(0.75 * args.max_input_length - prefix_length)
+    
+    # TODO: set the cross_file_budget as a hyperparameter
+    cross_file_budget = int(0.25 * args.max_input_length)
+    repo_content = {
+        "input_ids": [],
+        "attention_mask": []
+    }
+    related_idx = 0
+    while related_idx < len(related_codes) and len(repo_content["input_ids"]) + len(related_tokenized_result["input_ids"][related_idx]) < cross_file_budget:
+        repo_content["input_ids"].extend(related_tokenized_result["input_ids"][related_idx])
+        repo_content["attention_mask"].extend(related_tokenized_result["attention_mask"][related_idx])
+        related_idx += 1
+    
+    left_budget = args.max_input_length - len(repo_content["input_ids"]) - len(middle_tokenized_result["input_ids"]) - 3
+    prefix_length = int(left_budget / 2)
+    suffix_length = int(left_budget - prefix_length)
     prefix_ids = prefix_tokenized_result["input_ids"] if len(prefix_tokenized_result["input_ids"]) < prefix_length else prefix_tokenized_result["input_ids"][-prefix_length:]
     suffix_ids = suffix_tokenized_result["input_ids"] if len(suffix_tokenized_result["input_ids"]) < suffix_length else suffix_tokenized_result["input_ids"][:suffix_length]
     middle_ids = middle_tokenized_result["input_ids"]
@@ -79,31 +99,19 @@ def convert_example_to_feature(prefix:str, suffix:str, middle:str, related_files
         "input_ids": [suffix_id] + suffix_ids + [prefix_id] + prefix_ids + [middle_id] + middle_ids,
         "attention_mask": [1] * (len(prefix_ids) + len(suffix_ids) + len(middle_ids) + 3)
     }
-    repo_content = {
-        "input_ids": [],
-        "attention_mask": []
-    }
-    left_budget = args.max_input_length - len(direct_content["input_ids"])
-    related_idx = 0
-    while related_idx < len(related_codes) and len(repo_content["input_ids"]) + len(related_tokenized_result["input_ids"][related_idx]) < left_budget:
-        repo_content["input_ids"].extend(related_tokenized_result["input_ids"][related_idx] + [tokenizer.sep_token_id])
-        repo_content["attention_mask"].extend(related_tokenized_result["attention_mask"][related_idx] + [1])
-        related_idx += 1
+    
     
     input_ids = repo_content["input_ids"] + direct_content["input_ids"]
     attention_mask = repo_content["attention_mask"] + direct_content["attention_mask"]
-    if do_generate:
-        feature = InputFeatures(input_ids, attention_mask, None)
-    else:
-        feature = InputFeatures(input_ids + [tokenizer.pad_token_id] * (args.max_input_length - len(input_ids)), 
-                                attention_mask + [0] * (args.max_input_length - len(input_ids)), 
-                                [-100] * (len(input_ids) - len(middle_ids)) + middle_ids + [-100] * (args.max_input_length - len(input_ids))
-        )
-        if len(feature.input_ids) != len(feature.target_ids) or len(feature.input_ids) != args.max_input_length:
-            print(len(repo_content["input_ids"]))
-            print(len(direct_content["input_ids"]))
-            print(len(middle_ids))
-        assert len(feature.input_ids) == len(feature.target_ids) == args.max_input_length
+    feature = InputFeatures(input_ids + [tokenizer.pad_token_id] * (args.max_input_length - len(input_ids)), 
+                            attention_mask + [0] * (args.max_input_length - len(input_ids)), 
+                            [-100] * (len(input_ids) - len(middle_ids)) + middle_ids + [-100] * (args.max_input_length - len(input_ids))
+    )
+    if len(feature.input_ids) != len(feature.target_ids) or len(feature.input_ids) != args.max_input_length:
+        print(len(repo_content["input_ids"]))
+        print(len(direct_content["input_ids"]))
+        print(len(middle_ids))
+    assert len(feature.input_ids) == len(feature.target_ids) == args.max_input_length
     return feature
   
 
@@ -122,8 +130,9 @@ def DoNothingCollator(batch):
     return batch
 
 def test(all_eval_examples:Dict[str, List[Example]], generator:PreTrainedModel, tokenizer:PreTrainedTokenizer, args, epoch:int):
+    generator.eval()
     for name, examples in all_eval_examples.items():
-        print("Evaluating on {} dataset".format(name))
+        logger.info("Evaluating on {} dataset".format(name))
         generations = generate(args, generator, tokenizer, examples)
         if os.path.exists(f"{args.output_dir}/result_{epoch}/{name}") is False:
             os.makedirs(f"{args.output_dir}/result_{epoch}/{name}", exist_ok=True)
@@ -134,7 +143,9 @@ def test(all_eval_examples:Dict[str, List[Example]], generator:PreTrainedModel, 
                 results = compute_metric_stmt(f"{args.output_dir}/result_{epoch}/{name}", "data/cceval/python/test.jsonl")
             elif name == "repoeval_line":
                 results = compute_metric_stmt(f"{args.output_dir}/result_{epoch}/{name}", "data/repoeval/line_level/test.jsonl")
-        print(f"{name} epoch {epoch}: {str(results)}")
+        logger.info(f"{name} epoch {epoch}: {str(results)}")
+    torch.save(generator.state_dict(), f"{args.output_dir}/result_{epoch}/model.pth")
+    generator.train()
 def main():
     parser = argparse.ArgumentParser()
 
@@ -226,10 +237,7 @@ def main():
         valid_data = data[int(len(data)*0.9):]
         train_features = []
         for example in tqdm(train_data):
-            train_features.append(convert_example_to_feature(example.prefix, example.suffix, example.middle, example.relevant_code, tokenizer, False, args))
-        valid_features = []
-        for example in tqdm(valid_data):
-            valid_features.append(convert_example_to_feature(example.prefix, example.suffix, example.middle, example.relevant_code, tokenizer, False, args))
+            train_features.append(convert_example_to_feature(example.prefix, example.suffix, example.middle, example.relevant_code, tokenizer, args))
         train_dataset = MyDataset(train_features)
         train_sampler = RandomSampler(train_dataset)
         train_dataloader = DataLoader(train_dataset, sampler=train_sampler, 
@@ -255,6 +263,9 @@ def main():
         logger.info("  Num epoch = %d", args.num_train_epochs)
         
         losses = []
+        
+        if args.do_valid:
+            test({"github_project":valid_data}, generator, tokenizer, args, 0)
         
         for epoch in range(args.num_train_epochs):
             for batch in train_dataloader:
@@ -287,6 +298,9 @@ def main():
                                                      len(losses)//args.gradient_accumulation_steps,
                                                      round(np.mean(losses[-100*args.gradient_accumulation_steps:]),4)))
         
+            if args.do_valid:
+                test({"github_project":valid_data}, generator, tokenizer, args, epoch)
+    
     if args.do_test:
         
         if all_eval_examples is None:
@@ -296,6 +310,7 @@ def main():
                 "cceval_python": load_dataset("cceval_python"),
                 "repoeval_line": load_dataset("repoeval_line")
             }
+        
         
         test(all_eval_examples, generator, tokenizer, args, 0 if not args.do_train else epoch)
                 

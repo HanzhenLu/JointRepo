@@ -3,9 +3,10 @@ import pandas as pd
 import tokenize
 import io
 import re
-from typing import Tuple, List, Union
+from fastbm25 import fastbm25
+from typing import Tuple, List
 from torch import FloatTensor, LongTensor
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizer
 from transformers.generation.stopping_criteria import StoppingCriteria
 
 class Example:
@@ -57,6 +58,8 @@ def load_dataset(datasetname:str) -> List[Example]:
         data_frame_parts.append(pd.read_parquet("data/repoeval/line_level/test_0.parquet"))
         data_frame_parts.append(pd.read_parquet("data/repoeval/line_level/test_1.parquet"))
         data_frame = pd.concat(data_frame_parts)
+    elif datasetname == "github_projects":
+        data_frame = pd.read_json("data/github_projects/python/train.json")
     else:
         raise Exception("Unsupport dataset name")
 
@@ -116,12 +119,12 @@ def split_into_smaller_blocks(code_block:CodeBlock, enable_fixed_block:bool) -> 
     """
     smaller_blocks = []
 
-    # 每12行划分一个block
+    # 每15行划分一个block
     if enable_fixed_block:
         lines = [line for line in code_block.code_content.split('\n') if line.strip() != '']
-        for i in range(0, min(len(lines),5000), 12):
+        for i in range(0, min(len(lines),5000), 15):
             start_line_offset = i
-            end_line_offset = min(i + 12, len(lines))
+            end_line_offset = min(i + 15, len(lines))
             block_content = '\n'.join(lines[start_line_offset:end_line_offset])
             smaller_blocks.append(CodeBlock(code_block.file_path, 
                                             block_content))
@@ -141,7 +144,7 @@ def split_into_smaller_blocks(code_block:CodeBlock, enable_fixed_block:bool) -> 
             mini_blocks.append(current_block)
 
         # 超过12行的block划分成多个block
-        max_len = 12
+        max_len = 15
         temp_mini_blocks = []
         for mini_block in mini_blocks:
             if len(mini_block) > max_len:
@@ -230,3 +233,9 @@ def get_NL_list(tokenizer:AutoTokenizer) -> List[int]:
             NL_list.append(id)
     return NL_list
 
+def bm25_retrieve(query_str:str, candidate_str:str, tokenizer:PreTrainedTokenizer, k:int):
+    tokenized_corpus = [tokenizer.tokenize(doc) for doc in candidate_str]
+    bm25_model = fastbm25(tokenized_corpus)
+    query = tokenizer.tokenize(query_str)
+    result = bm25_model.top_k_sentence(query, k=k)
+    return result
