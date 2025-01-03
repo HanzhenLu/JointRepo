@@ -159,8 +159,7 @@ def generate(args, generator:PreTrainedModel, tokenizer:PreTrainedTokenizer, exa
             input_ids, attention_mask = [x.to(generator.device) for x in batch]
             generated_ids = generator.generate(input_ids, attention_mask=attention_mask, 
                 max_length=input_ids.size(1)+args.max_generation_length, pad_token_id=tokenizer.pad_token_id)
-            generated_codes.append(generated_ids[:, input_ids.size(1):])
-    generated_codes = torch.cat(generated_codes, 0)
+            generated_codes.extend(generated_ids[:, input_ids.size(1):])
     return [tokenizer.decode(generated_id, skip_special_tokens=True) for generated_id in generated_codes]
 
 def test(all_eval_examples:Dict[str, List[Example]], generator:PreTrainedModel, tokenizer:PreTrainedTokenizer, args, epoch:int):

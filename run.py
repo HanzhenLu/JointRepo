@@ -11,7 +11,7 @@ from typing import List, Tuple, Dict
 from torch.utils.data import DataLoader, Dataset, RandomSampler
 from transformers import (AdamW, get_linear_schedule_with_warmup, PreTrainedTokenizer, PreTrainedModel)
 
-from utils.util import (load_dataset, CodeBlock, split_into_smaller_blocks, Example, bm25_retrieve)
+from utils.util import (load_dataset, CodeBlock, split_into_smaller_blocks, Example, bm25_retrieve, cross_file_contexts)
 from model import (build_model, generate)
 from eval import compute_metric_stmt
 
@@ -58,36 +58,15 @@ def convert_example_to_feature(prefix:str, suffix:str, middle:str, related_files
         query_str = "\n".join(prefix_line)
         suffix_line = suffix.split("\n")
         query_str += "\n" + "\n".join(suffix_line[:15-len(prefix_line)])
-    result = bm25_retrieve(query_str, candidate_str, k=args.relevant_code_num)
+    result = bm25_retrieve(query_str, candidate_str, tokenizer, k=args.relevant_code_num)
     
     related_codes = [code_blocks[x[1]] for x in result]
-    filter_codeblocks = []
-    for x in related_codes:
-        file_path = x.file_path
-        code_content = x.code_content
-        if file_path != "":
-            filter_codeblocks.append(f"#{file_path}\n{code_content}" if code_content.endswith("\n") else f"#{file_path}\n{code_content}\n")
-        else:
-            break
+    # TODO: set the cross_file_budget as a hyperparameter
+    repo_content = cross_file_contexts(related_codes, tokenizer, int(args.max_input_length * 0.25))
     
-    if len(related_codes) > 0:
-        related_tokenized_result = tokenizer(filter_codeblocks, add_special_tokens=False)
-        
     prefix_tokenized_result = tokenizer(prefix, add_special_tokens=False)
     suffix_tokenized_result = tokenizer(suffix, add_special_tokens=False)
     middle_tokenized_result = tokenizer(middle, add_special_tokens=False)
-    
-    # TODO: set the cross_file_budget as a hyperparameter
-    cross_file_budget = int(0.25 * args.max_input_length)
-    repo_content = {
-        "input_ids": [],
-        "attention_mask": []
-    }
-    related_idx = 0
-    while related_idx < len(related_codes) and len(repo_content["input_ids"]) + len(related_tokenized_result["input_ids"][related_idx]) < cross_file_budget:
-        repo_content["input_ids"].extend(related_tokenized_result["input_ids"][related_idx])
-        repo_content["attention_mask"].extend(related_tokenized_result["attention_mask"][related_idx])
-        related_idx += 1
     
     left_budget = args.max_input_length - len(repo_content["input_ids"]) - len(middle_tokenized_result["input_ids"]) - 3
     prefix_length = int(left_budget / 2)
@@ -139,10 +118,13 @@ def test(all_eval_examples:Dict[str, List[Example]], generator:PreTrainedModel, 
         with open(f"{args.output_dir}/result_{epoch}/{name}/prediction.jsonl", "w", encoding="utf-8") as f_pred:
             for example, generation in zip(examples, generations):
                 f_pred.write(json.dumps({"task_id": example.task_id, "pred": generation}) + "\n")
-            if name == "cceval_python":
-                results = compute_metric_stmt(f"{args.output_dir}/result_{epoch}/{name}", "data/cceval/python/test.jsonl")
-            elif name == "repoeval_line":
-                results = compute_metric_stmt(f"{args.output_dir}/result_{epoch}/{name}", "data/repoeval/line_level/test.jsonl")
+        if name == "cceval_python":
+            results = compute_metric_stmt(f"{args.output_dir}/result_{epoch}/{name}", "data/cceval/python/test.jsonl")
+        elif name == "repoeval_line":
+            results = compute_metric_stmt(f"{args.output_dir}/result_{epoch}/{name}", "data/repoeval/line_level/test.jsonl")
+        elif name == "github_projects":
+            targets, generations = ["".join(x.target_code.split()) for x in examples], ["".join(x.split()) for x in generations]
+            results["em"] = round(sum([1 if x[:min(len(y),len(x))] == y[:min(len(y),len(x))] else 0 for x,y in zip(generations, targets)])/len(generations)*100,4)
         logger.info(f"{name} epoch {epoch}: {str(results)}")
     torch.save(generator.state_dict(), f"{args.output_dir}/result_{epoch}/model.pth")
     generator.train()

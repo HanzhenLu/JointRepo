@@ -5,12 +5,10 @@ import logging
 import torch
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM, PreTrainedModel, PreTrainedTokenizer
-from transformers.generation.stopping_criteria import StoppingCriteriaList
 from torch.utils.data import DataLoader, Dataset, SequentialSampler
-from typing import Tuple, List, Dict
-from fastbm25 import fastbm25
+from typing import Tuple, List
 
-from utils.util import Example, split_into_smaller_blocks, CodeBlock
+from utils.util import Example, split_into_smaller_blocks, CodeBlock, bm25_retrieve, cross_file_contexts
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +51,13 @@ class CustomDataset(Dataset):
             "suffix_id": tokenizer.convert_tokens_to_ids("<SUFFIX>"),
             "middle_id": tokenizer.convert_tokens_to_ids("<MIDDLE>")
         }
-        
+        self.input_ids = []
+        self.attention_mask = []
+        for example in tqdm(examples):
+            input_ids, attention_mask = self.construct_prompt(example).values()
+            self.input_ids.append(torch.tensor(input_ids)) 
+            self.attention_mask.append(torch.tensor(attention_mask))
+
     def __len__(self):
         return len(self.examples)
     
@@ -68,45 +72,23 @@ class CustomDataset(Dataset):
         for file in example.relevant_code:
             code_blocks.extend(split_into_smaller_blocks(file, self.args.enable_fixed_block))
             
-        tokenized_corpus = [self.tokenizer.tokenize(doc.code_content) for doc in code_blocks]
-        bm25_model = fastbm25(tokenized_corpus)
         prefix_line = prefix.split("\n")
         # TODO: set the query_line as a hyperparameter
         if len(prefix_line) >= 15:
-            query = "\n".join(prefix_line[-15:])
+            query_str = "\n".join(prefix_line[-15:])
         else:
-            query = "\n".join(prefix_line)
+            query_str = "\n".join(prefix_line)
             suffix_line = suffix.split("\n")
-            query += "\n" + "\n".join(suffix_line[:15-len(prefix_line)])
-        query = self.tokenizer.tokenize(query)
-        result = bm25_model.top_k_sentence(query, k=self.args.relevant_code_num)
+            query_str += "\n" + "\n".join(suffix_line[:15-len(prefix_line)])
+        result = bm25_retrieve(query_str, [code_block.code_content for code_block in code_blocks], self.tokenizer, self.args.relevant_code_num)
         retrieved_codeblocks = [code_blocks[x[1]] for x in result]
-        
-        filter_codeblocks = []
-        for x in retrieved_codeblocks:
-            file_path = x.file_path
-            code_content = x.code_content
-            if file_path != "":
-                filter_codeblocks.append(f"#{file_path}\n{code_content}" if code_content.endswith("\n") else f"#{file_path}\n{code_content}\n")
-            else:
-                break
-        
-        prefix_tokenized_result = self.tokenizer(prefix, add_special_tokens=False)
-        suffix_tokenized_result = self.tokenizer(suffix, add_special_tokens=False)
-        if len(filter_codeblocks) > 0:
-            related_tokenized_result = self.tokenizer(filter_codeblocks, add_special_tokens=False)
             
         # TODO: set the cross_file_budget as a hyperparameter
         cross_file_budget = int(0.25 * self.args.max_input_length)
-        repo_content = {
-            "input_ids": [],
-            "attention_mask": []
-        }
-        related_idx = 0
-        while related_idx < len(filter_codeblocks) and len(repo_content["input_ids"]) + len(related_tokenized_result["input_ids"][related_idx]) < cross_file_budget:
-            repo_content["input_ids"].extend(related_tokenized_result["input_ids"][related_idx])
-            repo_content["attention_mask"].extend(related_tokenized_result["attention_mask"][related_idx])
-            related_idx += 1
+        repo_content = cross_file_contexts(retrieved_codeblocks, self.tokenizer, cross_file_budget)
+        
+        prefix_tokenized_result = self.tokenizer(prefix, add_special_tokens=False)
+        suffix_tokenized_result = self.tokenizer(suffix, add_special_tokens=False)
         
         left_budget = self.args.max_input_length - len(repo_content["input_ids"]) - 3
         prefix_length = int(left_budget / 2)
@@ -130,9 +112,7 @@ class CustomDataset(Dataset):
         }
         
     def __getitem__(self, index) -> Tuple[torch.Tensor, torch.Tensor]:
-        example = self.examples[index]
-        input_ids, attention_mask = self.construct_prompt(example).values()
-        return torch.tensor(input_ids), torch.tensor(attention_mask)
+        return self.input_ids[index], self.attention_mask[index]
 
 def generate(args, generator:PreTrainedModel, tokenizer:PreTrainedTokenizer, examples:List[Example]) -> List[str]:
     generated_codes = []

@@ -4,7 +4,7 @@ import tokenize
 import io
 import re
 from fastbm25 import fastbm25
-from typing import Tuple, List
+from typing import Tuple, List, Dict
 from torch import FloatTensor, LongTensor
 from transformers import AutoTokenizer, PreTrainedTokenizer
 from transformers.generation.stopping_criteria import StoppingCriteria
@@ -239,3 +239,30 @@ def bm25_retrieve(query_str:str, candidate_str:str, tokenizer:PreTrainedTokenize
     query = tokenizer.tokenize(query_str)
     result = bm25_model.top_k_sentence(query, k=k)
     return result
+
+def cross_file_contexts(related_codes:List[CodeBlock], tokenizer:PreTrainedTokenizer, cross_file_budget:int) -> Dict[str, List[int]]:
+    filter_codeblocks = []
+    for x in related_codes:
+        file_path = x.file_path
+        code_content = x.code_content
+        # TODO: 真的需要把file path也附加上去吗
+        if file_path != "":
+            filter_codeblocks.append(f"#{file_path}\n{code_content}" if code_content.endswith("\n") else f"#{file_path}\n{code_content}\n")
+        else:
+            break
+    
+    if len(filter_codeblocks) > 0:
+        related_tokenized_result = tokenizer(filter_codeblocks, add_special_tokens=False)
+    
+    # TODO: set the cross_file_budget as a hyperparameter
+    repo_content = {
+        "input_ids": [],
+        "attention_mask": []
+    }
+    related_idx = 0
+    while related_idx < len(filter_codeblocks) and len(repo_content["input_ids"]) + len(related_tokenized_result["input_ids"][related_idx]) < cross_file_budget:
+        repo_content["input_ids"].extend(related_tokenized_result["input_ids"][related_idx])
+        repo_content["attention_mask"].extend(related_tokenized_result["attention_mask"][related_idx])
+        related_idx += 1
+    
+    return repo_content
