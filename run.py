@@ -68,27 +68,23 @@ def convert_example_to_feature(prefix:str, suffix:str, middle:str, related_files
     suffix_tokenized_result = tokenizer(suffix, add_special_tokens=False)
     middle_tokenized_result = tokenizer(middle, add_special_tokens=False)
     
-    left_budget = args.max_input_length - len(repo_content["input_ids"]) - len(middle_tokenized_result["input_ids"]) - 3
+    left_budget = args.max_input_length - len(repo_content["input_ids"]) - len(middle_tokenized_result["input_ids"]) - 4
     prefix_length = int(left_budget / 2)
     suffix_length = int(left_budget - prefix_length)
     prefix_ids = prefix_tokenized_result["input_ids"] if len(prefix_tokenized_result["input_ids"]) < prefix_length else prefix_tokenized_result["input_ids"][-prefix_length:]
     suffix_ids = suffix_tokenized_result["input_ids"] if len(suffix_tokenized_result["input_ids"]) < suffix_length else suffix_tokenized_result["input_ids"][:suffix_length]
     middle_ids = middle_tokenized_result["input_ids"]
-    direct_content = {
-        "input_ids": [suffix_id] + suffix_ids + [prefix_id] + prefix_ids + [middle_id] + middle_ids,
-        "attention_mask": [1] * (len(prefix_ids) + len(suffix_ids) + len(middle_ids) + 3)
-    }
-    
-    
-    input_ids = repo_content["input_ids"] + direct_content["input_ids"]
-    attention_mask = repo_content["attention_mask"] + direct_content["attention_mask"]
+
+    input_ids = [suffix_id] + suffix_ids + [prefix_id] + repo_content["input_ids"] + prefix_ids + [middle_id] + middle_ids + [tokenizer.eos_token_id]
+    attention_mask = [1] * len(input_ids)
+
     feature = InputFeatures(input_ids + [tokenizer.pad_token_id] * (args.max_input_length - len(input_ids)), 
                             attention_mask + [0] * (args.max_input_length - len(input_ids)), 
-                            [-100] * (len(input_ids) - len(middle_ids)) + middle_ids + [-100] * (args.max_input_length - len(input_ids))
+                            [-100] * (len(input_ids) - len(middle_ids) - 1) + middle_ids + [tokenizer.eos_token_id] + [-100] * (args.max_input_length - len(input_ids))
     )
     if len(feature.input_ids) != len(feature.target_ids) or len(feature.input_ids) != args.max_input_length:
         print(len(repo_content["input_ids"]))
-        print(len(direct_content["input_ids"]))
+        print(len(input_ids))
         print(len(middle_ids))
     assert len(feature.input_ids) == len(feature.target_ids) == args.max_input_length
     return feature
@@ -112,7 +108,8 @@ def test(all_eval_examples:Dict[str, List[Example]], generator:PreTrainedModel, 
     generator.eval()
     for name, examples in all_eval_examples.items():
         logger.info("Evaluating on {} dataset".format(name))
-        generations = generate(args, generator, tokenizer, examples)
+        model_to_generate = generator.module if hasattr(generator, "module") else generator
+        generations = generate(args, model_to_generate, tokenizer, examples)
         if os.path.exists(f"{args.output_dir}/result_{epoch}/{name}") is False:
             os.makedirs(f"{args.output_dir}/result_{epoch}/{name}", exist_ok=True)
         with open(f"{args.output_dir}/result_{epoch}/{name}/prediction.jsonl", "w", encoding="utf-8") as f_pred:
@@ -123,17 +120,27 @@ def test(all_eval_examples:Dict[str, List[Example]], generator:PreTrainedModel, 
         elif name == "repoeval_line":
             results = compute_metric_stmt(f"{args.output_dir}/result_{epoch}/{name}", "data/repoeval/line_level/test.jsonl")
         elif name == "github_projects":
-            targets, generations = ["".join(x.target_code.split()) for x in examples], ["".join(x.split()) for x in generations]
+            targets, generations = ["".join(x.middle.split()) for x in examples], ["".join(x.split()) for x in generations]
+            results = {}
             results["em"] = round(sum([1 if x[:min(len(y),len(x))] == y[:min(len(y),len(x))] else 0 for x,y in zip(generations, targets)])/len(generations)*100,4)
+        else:
+            raise Exception("unsupport test set")
         logger.info(f"{name} epoch {epoch}: {str(results)}")
-    torch.save(generator.state_dict(), f"{args.output_dir}/result_{epoch}/model.pth")
+    if hasattr(generator, "module"):
+        model_to_save = generator.module
+    else:
+        model_to_save = generator
+    torch.save(model_to_save.state_dict(), f"{args.output_dir}/result_{epoch}/model.pth")
     generator.train()
+
 def main():
     parser = argparse.ArgumentParser()
 
     ## Required parameters  
     parser.add_argument("--model_name_or_path", default=None, type=str, required=True,
                         help="Path to pre-trained model: e.g. roberta-base" )   
+    parser.add_argument("--weighted_parameters", default=None, type=str, required=False,
+                        help="Path to .pth file: e.g. roberta-base" )   
     parser.add_argument("--output_dir", default=None, type=str, required=True,
                         help="The output directory where the model predictions and checkpoints will be written.")   
   
@@ -188,7 +195,7 @@ def main():
     logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                     datefmt='%m/%d/%Y %H:%M:%S',level=logging.INFO )
     
-    logger_path = os.path.join(args.output_dir, 'train.log') if args.do_train else os.path.join(args.output_dir, 'test')
+    logger_path = os.path.join(args.output_dir, 'train.log') if args.do_train else os.path.join(args.output_dir, 'test.log')
     fh = logging.FileHandler(logger_path)
     fh.setLevel(logging.INFO)
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(name)s -   %(message)s')
@@ -247,20 +254,21 @@ def main():
         losses = []
         
         if args.do_valid:
-            test({"github_project":valid_data}, generator, tokenizer, args, 0)
+            test({"github_projects":valid_data}, generator, tokenizer, args, 0)
         
-        for epoch in range(args.num_train_epochs):
+        for epoch in range(1, args.num_train_epochs+1):
             for batch in train_dataloader:
                 generator.train()
                 
                 # Cat the ids of code, relevant document to form the final input
                 inputs = [feature.input_ids for feature in batch]
+                attention_mask = [feature.attention_mask for feature in batch]
                 outputs = [feature.target_ids for feature in batch]
                 inputs = torch.tensor(inputs, dtype=torch.long).to(device)
+                attention_mask = torch.tensor(attention_mask, dtype=torch.bool).to(device)
                 outputs = torch.tensor(outputs, dtype=torch.long).to(device)
-                source_mask = inputs.ne(tokenizer.pad_token_id)
                 results = generator(input_ids=inputs, 
-                                    attention_mask=source_mask,
+                                    attention_mask=attention_mask,
                                     labels=outputs)
                 loss = results.loss
                 
@@ -281,7 +289,7 @@ def main():
                                                      round(np.mean(losses[-100*args.gradient_accumulation_steps:]),4)))
         
             if args.do_valid:
-                test({"github_project":valid_data}, generator, tokenizer, args, epoch)
+                test({"github_projects":valid_data}, generator, tokenizer, args, epoch)
     
     if args.do_test:
         

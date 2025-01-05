@@ -26,6 +26,9 @@ def build_model(args) -> Tuple[AutoModelForCausalLM, AutoTokenizer]:
         )
         logger.info("Add <SEP> into the tokenizer")
     generator = AutoModelForCausalLM.from_pretrained(args.model_name_or_path)
+    if args.weighted_parameters is not None:
+        logger.info(f"loadding parameters from {args.weighted_parameters}")
+        generator.load_state_dict(torch.load(args.weighted_parameters))
 
     logger.info("Finish loading generator [%s] from %s", get_model_size(generator), args.model_name_or_path)
 
@@ -41,7 +44,7 @@ class CustomDataset(Dataset):
         retrieved_codeblocks: Retrieved code blocks.
     """
     
-    def __init__(self, args, tokenizer, examples:List[Example]) -> None:
+    def __init__(self, args, tokenizer:PreTrainedTokenizer, examples:List[Example]) -> None:
         super().__init__()
         self.args = args
         self.tokenizer = tokenizer
@@ -96,13 +99,15 @@ class CustomDataset(Dataset):
         prefix_ids = prefix_tokenized_result["input_ids"] if len(prefix_tokenized_result["input_ids"]) < prefix_length else prefix_tokenized_result["input_ids"][-prefix_length:]
         suffix_ids = suffix_tokenized_result["input_ids"] if len(suffix_tokenized_result["input_ids"]) < suffix_length else suffix_tokenized_result["input_ids"][:suffix_length]
         
-        direct_content = {
-            "input_ids": [self.special_tokens["suffix_id"]] + suffix_ids + [self.special_tokens["prefix_id"]] + prefix_ids + [self.special_tokens["middle_id"]],
-            "attention_mask": [1] * (len(prefix_ids) + len(suffix_ids) + 3)
-        }
+        # direct_content = {
+        #     "input_ids": [self.special_tokens["suffix_id"]] + suffix_ids + [self.special_tokens["prefix_id"]] + prefix_ids + [self.special_tokens["middle_id"]],
+        #     "attention_mask": [1] * (len(prefix_ids) + len(suffix_ids) + 3)
+        # }
         
-        input_ids = repo_content["input_ids"] + direct_content["input_ids"]
-        attention_mask = repo_content["attention_mask"] + direct_content["attention_mask"]
+        # input_ids = repo_content["input_ids"] + direct_content["input_ids"]
+        # attention_mask = repo_content["attention_mask"] + direct_content["attention_mask"]
+        input_ids = [self.special_tokens["suffix_id"]] + suffix_ids + [self.special_tokens["prefix_id"]] + repo_content["input_ids"] + prefix_ids + [self.special_tokens["middle_id"]]
+        attention_mask = [1] * len(input_ids)
         padding_length = self.args.max_input_length - len(input_ids)
         input_ids = [self.tokenizer.pad_token_id] * padding_length + input_ids
         attention_mask = [0] * padding_length + attention_mask
@@ -123,7 +128,7 @@ def generate(args, generator:PreTrainedModel, tokenizer:PreTrainedTokenizer, exa
     pbar = tqdm(dataloader, desc="Generating")
     with torch.no_grad():
         for batch in pbar:
-            input_ids, attention_mask = [x.to(generator.device) for x in batch]
+            input_ids, attention_mask = [x.to(args.device) for x in batch]
             generated_ids = generator.generate(input_ids, attention_mask=attention_mask, 
                 max_length=input_ids.size(1)+args.max_generation_length, pad_token_id=tokenizer.pad_token_id)
             generated_codes.extend(generated_ids[:, input_ids.size(1):])
