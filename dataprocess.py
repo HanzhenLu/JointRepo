@@ -117,7 +117,7 @@ if __name__ == "__main__":
                     } for x in related_codes
                 ]
                 
-            samples.append(sample)
+                samples.append(sample)
         
         if len(samples) > 200:
             selected_samples = random.choices(samples, k=200)

@@ -164,7 +164,7 @@ def generate(args, generator:PreTrainedModel, tokenizer:PreTrainedTokenizer, exa
 
 def test(all_eval_examples:Dict[str, List[Example]], generator:PreTrainedModel, tokenizer:PreTrainedTokenizer, args, epoch:int):
     for name, examples in all_eval_examples.items():
-        print("Evaluating on {} dataset".format(name))
+        logger.info("Evaluating on {} dataset".format(name))
         generations = generate(args, generator, tokenizer, examples)
         if os.path.exists(f"{args.output_dir}/result_{epoch}/{name}") is False:
             os.makedirs(f"{args.output_dir}/result_{epoch}/{name}", exist_ok=True)
@@ -176,7 +176,7 @@ def test(all_eval_examples:Dict[str, List[Example]], generator:PreTrainedModel, 
             elif name == "repoeval_line":
                 results = compute_metric_stmt(f"{args.output_dir}/result_{epoch}/{name}", "data/repoeval/line_level/test.jsonl")
         
-        print(f"{name} epoch {epoch}: {str(results)}")
+        logger.info(f"{name} epoch {epoch}: {str(results)}")
 def main():
     parser = argparse.ArgumentParser()
 
@@ -213,7 +213,7 @@ def main():
     logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                     datefmt='%m/%d/%Y %H:%M:%S',level=logging.INFO )
     
-    logger_path = os.path.join(args.output_dir, 'test')
+    logger_path = os.path.join(args.output_dir, 'test.log')
     fh = logging.FileHandler(logger_path)
     fh.setLevel(logging.INFO)
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(name)s -   %(message)s')
