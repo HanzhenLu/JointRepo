@@ -26,7 +26,7 @@ def build_model(args) -> Tuple[AutoModelForCausalLM, AutoTokenizer]:
         )
         logger.info("Add <SEP> into the tokenizer")
     generator = AutoModelForCausalLM.from_pretrained(args.model_name_or_path)
-    if args.weighted_parameters is not None:
+    if hasattr(args, "weighted_parameters") and args.weighted_parameters is not None:
         logger.info(f"loadding parameters from {args.weighted_parameters}")
         generator.load_state_dict(torch.load(args.weighted_parameters))
 
@@ -96,16 +96,21 @@ class CustomDataset(Dataset):
         left_budget = self.args.max_input_length - len(repo_content["input_ids"]) - 3
         prefix_length = int(left_budget / 2)
         suffix_length = int(left_budget - prefix_length)
-        prefix_ids = prefix_tokenized_result["input_ids"] if len(prefix_tokenized_result["input_ids"]) < prefix_length else prefix_tokenized_result["input_ids"][-prefix_length:]
-        suffix_ids = suffix_tokenized_result["input_ids"] if len(suffix_tokenized_result["input_ids"]) < suffix_length else suffix_tokenized_result["input_ids"][:suffix_length]
+        if len(prefix_tokenized_result["input_ids"]) < prefix_length and len(suffix_tokenized_result["input_ids"]) < suffix_length:
+            prefix_ids = prefix_tokenized_result["input_ids"]
+            suffix_ids = suffix_tokenized_result["input_ids"]
+        elif len(prefix_tokenized_result["input_ids"]) < prefix_length:
+            prefix_ids = prefix_tokenized_result["input_ids"]
+            suffix_length = int(left_budget - len(prefix_ids))
+            suffix_ids = suffix_tokenized_result["input_ids"][:suffix_length]
+        elif len(suffix_tokenized_result["input_ids"]) < suffix_length:
+            suffix_ids = suffix_tokenized_result["input_ids"]
+            prefix_length = int(left_budget - len(suffix_ids))
+            prefix_ids = prefix_tokenized_result["input_ids"][-prefix_length:]
+        else:
+            prefix_ids = prefix_tokenized_result["input_ids"][-prefix_length:]
+            suffix_ids = suffix_tokenized_result["input_ids"][:suffix_length]
         
-        # direct_content = {
-        #     "input_ids": [self.special_tokens["suffix_id"]] + suffix_ids + [self.special_tokens["prefix_id"]] + prefix_ids + [self.special_tokens["middle_id"]],
-        #     "attention_mask": [1] * (len(prefix_ids) + len(suffix_ids) + 3)
-        # }
-        
-        # input_ids = repo_content["input_ids"] + direct_content["input_ids"]
-        # attention_mask = repo_content["attention_mask"] + direct_content["attention_mask"]
         input_ids = [self.special_tokens["suffix_id"]] + suffix_ids + [self.special_tokens["prefix_id"]] + repo_content["input_ids"] + prefix_ids + [self.special_tokens["middle_id"]]
         attention_mask = [1] * len(input_ids)
         padding_length = self.args.max_input_length - len(input_ids)

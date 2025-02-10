@@ -71,8 +71,20 @@ def convert_example_to_feature(prefix:str, suffix:str, middle:str, related_files
     left_budget = args.max_input_length - len(repo_content["input_ids"]) - len(middle_tokenized_result["input_ids"]) - 4
     prefix_length = int(left_budget / 2)
     suffix_length = int(left_budget - prefix_length)
-    prefix_ids = prefix_tokenized_result["input_ids"] if len(prefix_tokenized_result["input_ids"]) < prefix_length else prefix_tokenized_result["input_ids"][-prefix_length:]
-    suffix_ids = suffix_tokenized_result["input_ids"] if len(suffix_tokenized_result["input_ids"]) < suffix_length else suffix_tokenized_result["input_ids"][:suffix_length]
+    if len(prefix_tokenized_result["input_ids"]) < prefix_length and len(suffix_tokenized_result["input_ids"]) < suffix_length:
+        prefix_ids = prefix_tokenized_result["input_ids"]
+        suffix_ids = suffix_tokenized_result["input_ids"]
+    elif len(prefix_tokenized_result["input_ids"]) < prefix_length:
+        prefix_ids = prefix_tokenized_result["input_ids"]
+        suffix_length = int(left_budget - len(prefix_ids))
+        suffix_ids = suffix_tokenized_result["input_ids"][:suffix_length]
+    elif len(suffix_tokenized_result["input_ids"]) < suffix_length:
+        suffix_ids = suffix_tokenized_result["input_ids"]
+        prefix_length = int(left_budget - len(suffix_ids))
+        prefix_ids = prefix_tokenized_result["input_ids"][-prefix_length:]
+    else:
+        prefix_ids = prefix_tokenized_result["input_ids"][-prefix_length:]
+        suffix_ids = suffix_tokenized_result["input_ids"][:suffix_length]
     middle_ids = middle_tokenized_result["input_ids"]
 
     input_ids = [suffix_id] + suffix_ids + [prefix_id] + repo_content["input_ids"] + prefix_ids + [middle_id] + middle_ids + [tokenizer.eos_token_id]
@@ -119,6 +131,10 @@ def test(all_eval_examples:Dict[str, List[Example]], generator:PreTrainedModel, 
             results = compute_metric_stmt(f"{args.output_dir}/result_{epoch}/{name}", "data/cceval/python/test.jsonl")
         elif name == "repoeval_line":
             results = compute_metric_stmt(f"{args.output_dir}/result_{epoch}/{name}", "data/repoeval/line_level/test.jsonl")
+        elif name == "ours":
+            results = compute_metric_stmt(f"{args.output_dir}/result_{epoch}/{name}", "data/ours/python/test.jsonl")
+        elif name == "ours_suffix":
+            results = compute_metric_stmt(f"{args.output_dir}/result_{epoch}/{name}", "data/ours/python/test_suffix.jsonl")
         elif name == "github_projects":
             targets, generations = ["".join(x.middle.split()) for x in examples], ["".join(x.split()) for x in generations]
             results = {}
@@ -139,7 +155,7 @@ def main():
     ## Required parameters  
     parser.add_argument("--model_name_or_path", default=None, type=str, required=True,
                         help="Path to pre-trained model: e.g. roberta-base" )   
-    parser.add_argument("--weighted_parameters", default=None, type=str, required=False,
+    parser.add_argument("--weighted_parameters", default=None, type=str,
                         help="Path to .pth file: e.g. roberta-base" )   
     parser.add_argument("--output_dir", default=None, type=str, required=True,
                         help="The output directory where the model predictions and checkpoints will be written.")   
@@ -181,7 +197,7 @@ def main():
                         help="Total number of relevant code blocks to use")
     parser.add_argument('--max_input_length', default=1024, type=int,
                         help="Max token num for input feature")
-    parser.add_argument('--max_generation_length', default=30, type=int,
+    parser.add_argument('--max_generation_length', default=50, type=int,
                         help="Max token num for generating when evaluate")
     
     # print arguments
@@ -297,6 +313,8 @@ def main():
             # first time to do valid
             
             all_eval_examples = {
+                "ours_suffix": load_dataset("ours_suffix"),
+                "ours": load_dataset("ours"),
                 "cceval_python": load_dataset("cceval_python"),
                 "repoeval_line": load_dataset("repoeval_line")
             }

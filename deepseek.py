@@ -105,7 +105,7 @@ class CustomDataset(Dataset):
             related_tokenized_result = self.tokenizer(filter_codeblocks, add_special_tokens=False)
         
         # TODO: set the cross_file_budget as a hyperparameter
-        cross_file_budget = int(0.25 * self.args.max_input_length)
+        cross_file_budget = self.args.max_crossfile_length
         
         repo_content = {
             "input_ids": [],
@@ -120,17 +120,25 @@ class CustomDataset(Dataset):
         left_budget = self.args.max_input_length - len(repo_content["input_ids"]) - 4
         prefix_length = int(left_budget / 2)
         suffix_length = int(left_budget - prefix_length)
-        prefix_ids = prefix_tokenized_result["input_ids"] if len(prefix_tokenized_result["input_ids"]) < prefix_length else prefix_tokenized_result["input_ids"][-prefix_length:]
-        suffix_ids = suffix_tokenized_result["input_ids"] if len(suffix_tokenized_result["input_ids"]) < suffix_length else suffix_tokenized_result["input_ids"][:suffix_length]
-        
-        direct_content = {
-            # TODO: prefix id 放在哪需要进一步测试
-            "input_ids": [self.special_tokens["prefix_id"]] + prefix_ids + [self.special_tokens["middle_id"]] + suffix_ids + [self.special_tokens["suffix_id"]],
-            "attention_mask": [1] * (len(prefix_ids) + len(suffix_ids) + 3)
-        } 
-        
-        input_ids = [32013] + repo_content["input_ids"] + direct_content["input_ids"]
-        attention_mask = [1] + repo_content["attention_mask"] + direct_content["attention_mask"]
+        if len(prefix_tokenized_result["input_ids"]) < prefix_length and len(suffix_tokenized_result["input_ids"]) < suffix_length:
+            prefix_ids = prefix_tokenized_result["input_ids"]
+            suffix_ids = suffix_tokenized_result["input_ids"]
+        elif len(prefix_tokenized_result["input_ids"]) < prefix_length:
+            prefix_ids = prefix_tokenized_result["input_ids"]
+            suffix_length = int(left_budget - len(prefix_ids))
+            suffix_ids = suffix_tokenized_result["input_ids"][:suffix_length]
+        elif len(suffix_tokenized_result["input_ids"]) < suffix_length:
+            suffix_ids = suffix_tokenized_result["input_ids"]
+            prefix_length = int(left_budget - len(suffix_ids))
+            prefix_ids = prefix_tokenized_result["input_ids"][-prefix_length:]
+        else:
+            prefix_ids = prefix_tokenized_result["input_ids"][-prefix_length:]
+            suffix_ids = suffix_tokenized_result["input_ids"][:suffix_length]
+        # prefix_ids = prefix_tokenized_result["input_ids"][-left_budget:]
+        # suffix_ids = []
+    
+        input_ids = [32013] + [self.special_tokens["prefix_id"]] + repo_content["input_ids"] + prefix_ids + [self.special_tokens["middle_id"]] + suffix_ids + [self.special_tokens["suffix_id"]]
+        attention_mask = [1] * len(input_ids)
         padding_length = self.args.max_input_length - len(input_ids)
         input_ids = [self.tokenizer.pad_token_id] * padding_length + input_ids
         attention_mask = [0] * padding_length + attention_mask
@@ -175,8 +183,17 @@ def test(all_eval_examples:Dict[str, List[Example]], generator:PreTrainedModel, 
                 results = compute_metric_stmt(f"{args.output_dir}/result_{epoch}/{name}", "data/cceval/python/test.jsonl")
             elif name == "repoeval_line":
                 results = compute_metric_stmt(f"{args.output_dir}/result_{epoch}/{name}", "data/repoeval/line_level/test.jsonl")
-        
+            elif name == "github":
+                results = compute_metric_stmt(f"{args.output_dir}/result_{epoch}/{name}", "data/github/python/test.jsonl")
+            elif name == "ours":
+                results = compute_metric_stmt(f"{args.output_dir}/result_{epoch}/{name}", "data/ours/python/test.jsonl")
+            elif name == "ours_suffix":
+                results = compute_metric_stmt(f"{args.output_dir}/result_{epoch}/{name}", "data/ours/python/test_suffix.jsonl")
+            else:
+                raise Exception("unsupport test set")
+            
         logger.info(f"{name} epoch {epoch}: {str(results)}")
+        
 def main():
     parser = argparse.ArgumentParser()
 
@@ -199,7 +216,9 @@ def main():
                         help="Total number of relevant code blocks to use")
     parser.add_argument('--max_input_length', default=1024, type=int,
                         help="Max token num for input feature")
-    parser.add_argument('--max_generation_length', default=30, type=int,
+    parser.add_argument('--max_crossfile_length', default=512, type=int,
+                        help="Max token num for cross file content")
+    parser.add_argument('--max_generation_length', default=50, type=int,
                         help="Max token num for generating when evaluate")
     
     # print arguments
@@ -236,6 +255,9 @@ def main():
     generator.to(args.device)  
     
     all_eval_examples = {
+        # "github": load_dataset("github"),
+        "ours_suffix": load_dataset("ours_suffix"),
+        "ours": load_dataset("ours"),
         "cceval_python": load_dataset("cceval_python"),
         "repoeval_line": load_dataset("repoeval_line")
     }

@@ -9,7 +9,8 @@ from datetime import datetime
 API_URL = "https://api.github.com/search/repositories"
 
 # GitHub API Token
-GITHUB_TOKEN = "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"
+with open("github_token", 'r') as f:
+    GITHUB_TOKEN = f.read()
 
 # Headers for API request
 headers = {
@@ -19,7 +20,7 @@ headers = {
 
 # Parameters for the search query
 params = {
-    "q": "language:python created:>=2024-01-01 stars:>=50",
+    "q": "language:python created:2023-01-01..2023-12-31 stars:>=50 fork:false",
     "sort": "updated",
     "order": "desc",
     "per_page": 100,

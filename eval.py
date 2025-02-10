@@ -42,12 +42,24 @@ def compute_metric_stmt(output_dir, prompt_file, language="python"):
     truncated_samples = []
     em_labels = []
 
-    pool = mp.Pool(mp.cpu_count() - 1)
+    # pool = mp.Pool(mp.cpu_count() - 1)
+    # worker = partial(process_examples, ts_lang)
+
+    # with tqdm(total=len(samples), disable=True) as pbar:
+    #     for output in pool.imap_unordered(worker, zip(samples, [examples[s["task_id"]] for s in samples])):
+    #         trunc_s, em_label = output
+    #         em_labels.append(em_label)
+    #         truncated_samples.append(trunc_s)
+    #         pbar.update()
+    
+    # 移除 multiprocessing 相关代码，直接使用普通循环
     worker = partial(process_examples, ts_lang)
 
+    # 使用 tqdm 显示进度条（如果需要可以设置 disable=False 来启用）
     with tqdm(total=len(samples), disable=True) as pbar:
-        for output in pool.imap_unordered(worker, zip(samples, [examples[s["task_id"]] for s in samples])):
-            trunc_s, em_label = output
+        for sample, example in zip(samples, [examples[s["task_id"]] for s in samples]):
+            # 直接调用 worker 函数处理数据
+            trunc_s, em_label = worker((sample, example))
             em_labels.append(em_label)
             truncated_samples.append(trunc_s)
             pbar.update()
