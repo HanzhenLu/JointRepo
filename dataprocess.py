@@ -64,7 +64,7 @@ def construct_data(code_content:str) -> Tuple[str, str, str]:
 
 if __name__ == "__main__":
     
-    tokenizer = AutoTokenizer.from_pretrained("/data/hanzhenlu/LLaMA-Factory/saves/llama_100m_SPM_pretrained_sft_v4")
+    tokenizer = AutoTokenizer.from_pretrained("/data2/hanzhenlu/MODEL/char/llama_100m_SPM_pretrained_sft_v4")
     
     root = "github_projects"
     repo_names = os.listdir(root)

@@ -41,9 +41,6 @@ class InputFeatures(object):
         self.target_ids = target_ids
         
 def convert_example_to_feature(prefix:str, suffix:str, middle:str, related_files:List[CodeBlock], tokenizer:PreTrainedTokenizer, args) -> InputFeatures:
-    prefix_id = tokenizer.convert_tokens_to_ids("<PREFIX>")
-    suffix_id = tokenizer.convert_tokens_to_ids("<SUFFIX>")
-    middle_id = tokenizer.convert_tokens_to_ids("<MIDDLE>")
     
     code_blocks:List[CodeBlock] = []
     for file in related_files:
@@ -153,8 +150,10 @@ def main():
     parser = argparse.ArgumentParser()
 
     ## Required parameters  
-    parser.add_argument("--model_name_or_path", default=None, type=str, required=True,
+    parser.add_argument("--generator_name_or_path", default=None, type=str, required=True,
                         help="Path to pre-trained model: e.g. roberta-base" )   
+    parser.add_argument("--retriever_name_or_path", default=None, type=str, required=True,
+                        help="Path to pre-trained model: e.g. roberta-base" ) 
     parser.add_argument("--weighted_parameters", default=None, type=str,
                         help="Path to .pth file: e.g. roberta-base" )   
     parser.add_argument("--output_dir", default=None, type=str, required=True,
@@ -228,13 +227,15 @@ def main():
     set_seed(args.seed)
 
     # build model
-    generator, tokenizer = build_model(args)
+    generator, retriever, tokenizer = build_model(args)
     all_eval_examples = None
     
     logger.info("Training/evaluation parameters %s", args)
     generator.to(args.device)  
+    retriever.model.to(args.device)
     if args.n_gpu > 1:
         generator = torch.nn.DataParallel(generator)
+        retriever.model = torch.nn.DataParallel(retriever.model)
     
     if args.do_train:
         data = load_dataset(args.train_filename)

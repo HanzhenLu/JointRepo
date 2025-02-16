@@ -4,7 +4,7 @@ import numpy as np
 import logging
 import torch
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForCausalLM, PreTrainedModel, PreTrainedTokenizer
+from transformers import AutoTokenizer, AutoModelForCausalLM, PreTrainedModel, PreTrainedTokenizer, AutoModel
 from torch.utils.data import DataLoader, Dataset, SequentialSampler
 from typing import Tuple, List
 
@@ -12,27 +12,41 @@ from utils.util import Example, split_into_smaller_blocks, CodeBlock, bm25_retri
 
 logger = logging.getLogger(__name__)
 
+class Retriever:
+    def __init__(self, model_name_or_path:str):
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+        self.model = AutoModel.from_pretrained(model_name_or_path)
+    
+    def embedding(self, input_str:str):
+        inputs = self.tokenizer.encode(input_str, return_tensors="pt").to("cuda")
+        embedding = self.model(inputs)[0]
+        return embedding
+        
+
 def get_model_size(model):
     model_parameters = filter(lambda p: p.requires_grad, model.parameters())
     model_size = sum([np.prod(p.size()) for p in model_parameters])
     return "{}M".format(round(model_size / 1e+6))
 
 
-def build_model(args) -> Tuple[AutoModelForCausalLM, AutoTokenizer]:
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
+def build_model(args) -> Tuple[AutoModelForCausalLM, Retriever, AutoTokenizer]:
+    tokenizer = AutoTokenizer.from_pretrained(args.generator_name_or_path)
     if not tokenizer.sep_token:
         tokenizer.add_special_tokens(
             {'sep_token': '<SEP>'}
         )
         logger.info("Add <SEP> into the tokenizer")
-    generator = AutoModelForCausalLM.from_pretrained(args.model_name_or_path)
+    
+    generator = AutoModelForCausalLM.from_pretrained(args.generator_name_or_path)
     if hasattr(args, "weighted_parameters") and args.weighted_parameters is not None:
         logger.info(f"loadding parameters from {args.weighted_parameters}")
         generator.load_state_dict(torch.load(args.weighted_parameters))
 
-    logger.info("Finish loading generator [%s] from %s", get_model_size(generator), args.model_name_or_path)
+    logger.info("Finish loading generator [%s] from %s", get_model_size(generator), args.generator_name_or_path)
 
-    return generator, tokenizer
+    retriever = Retriever(args.retriever_name_or_path)
+    
+    return generator, retriever, tokenizer
 
 class CustomDataset(Dataset):
     """A dataset class for code generation
