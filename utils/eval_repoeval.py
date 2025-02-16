@@ -14,6 +14,19 @@ def load_jsonl(fname):
         return lines
 
 def compute_EM(target, predictions, passk):
+    if len(target) == 1:
+        for p in predictions[:passk]:
+            if len(p) == 0:
+                if target == "\n":
+                    return True
+                else:
+                    return False
+            else:
+                if p[0] == target:
+                    return True
+                else:
+                    return False
+        return False
     target_lines = [line.strip() for line in target.splitlines() if line.strip()]
     EM_scores = []
     for prediction in predictions[:passk]:
@@ -28,6 +41,19 @@ def compute_EM(target, predictions, passk):
     return any(EM_scores)
 
 def compute_ES(target, predictions, passk):
+    if len(target) == 1:
+        for p in predictions[:passk]:
+            if len(p) == 0:
+                if target == "\n":
+                    return 1
+                else:
+                    return 0
+            else:
+                if p[0] == target:
+                    return 1
+                else:
+                    return 0
+        return 0
     target_lines = [line.strip() for line in target.splitlines() if line.strip()]
     target_str = '\n'.join(target_lines)
     ES_scores = []
@@ -68,5 +94,5 @@ def eval_repoeval(file_path):
     }
 
 if __name__ == '__main__':
-    file_path = ''
+    file_path = '/data2/hanzhenlu/JointRepo/test.jsonl'
     print(eval_repoeval(file_path))

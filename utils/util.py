@@ -60,6 +60,10 @@ def load_dataset(datasetname:str) -> List[Example]:
         data_frame = pd.concat(data_frame_parts)
     elif datasetname == "github_projects":
         data_frame = pd.read_json("data/github_projects/python/train.json")
+    elif datasetname == "ours":
+        data_frame = pd.read_parquet("data/ours/python/test.parquet")
+    elif datasetname == "ours_suffix":
+        data_frame = pd.read_parquet("data/ours/python/test_suffix.parquet")
     else:
         raise Exception("Unsupport dataset name")
 
@@ -233,10 +237,13 @@ def get_NL_list(tokenizer:AutoTokenizer) -> List[int]:
             NL_list.append(id)
     return NL_list
 
-def bm25_retrieve(query_str:str, candidate_str:str, tokenizer:PreTrainedTokenizer, k:int):
-    tokenized_corpus = [tokenizer.tokenize(doc) for doc in candidate_str]
+def bm25_retrieve(query_str:str, candidate_str:List[str], tokenizer:PreTrainedTokenizer, k:int):
+    if k == 0:
+        return []
+    # TODO: 将检索使用的token数量设置为一个参数
+    tokenized_corpus = [tokenizer.tokenize(doc)[:200] for doc in candidate_str]
     bm25_model = fastbm25(tokenized_corpus)
-    query = tokenizer.tokenize(query_str)
+    query = tokenizer.tokenize(query_str)[:200]
     result = bm25_model.top_k_sentence(query, k=k)
     return result
 
@@ -254,7 +261,6 @@ def cross_file_contexts(related_codes:List[CodeBlock], tokenizer:PreTrainedToken
     if len(filter_codeblocks) > 0:
         related_tokenized_result = tokenizer(filter_codeblocks, add_special_tokens=False)
     
-    # TODO: set the cross_file_budget as a hyperparameter
     repo_content = {
         "input_ids": [],
         "attention_mask": []

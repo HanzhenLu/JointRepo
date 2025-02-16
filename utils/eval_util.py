@@ -47,6 +47,7 @@ def is_parse_valid(parser, code):
     if tree is not None:
         return not syntax_error(tree.root_node)
     return False
+
 def get_python_one_statement(prompt, completion:str, parser):
     for i in range(len(completion)):
         code = prompt + completion[:i + 1]
