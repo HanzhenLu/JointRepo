@@ -1,13 +1,12 @@
 import random
 import pandas as pd
-import tokenize
-import io
 import re
+import os
+import torch
+import numpy as np
 from fastbm25 import fastbm25
-from typing import Tuple, List, Dict
-from torch import FloatTensor, LongTensor
-from transformers import AutoTokenizer, PreTrainedTokenizer
-from transformers.generation.stopping_criteria import StoppingCriteria
+from typing import List, Dict
+from transformers import PreTrainedTokenizer, AutoTokenizer
 
 class Example:
     def __init__(self, task_id:str, prefix:str, suffix:str, middle:str, relevant_codes:List["CodeBlock"]) -> None:
@@ -17,33 +16,65 @@ class Example:
         self.middle = middle
         self.relevant_code = relevant_codes
 
-def load_train_and_valid_dataset(dataset_path:str) -> Tuple[List[List[Tuple[str, str]]], List[List[Tuple[str, str]]]]:
-    """
-    Loads the dataset.
-    :return: The training dataset and validation dataset.
-    """
-    training_datasets = []
-    validation_datasets = []
-    data_frame = pd.read_parquet(dataset_path)
-    all_data = []
-    temp_data = []
-    for x in data_frame[["path", "content", "first"]].values:
-        # get the value in "first" column and start of a new data if it is true
-        if x[-1]:
-            # end the last data
-            if len(temp_data) > 1:
-                all_data.append(temp_data)
-            temp_data = []
-        temp_data.append([x[0], x[1]])
-    # append the last data
-    if temp_data:
-        all_data.append(temp_data)
-    
-    random.shuffle(all_data)
-    training_datasets = all_data[:int(len(all_data) * 0.9)]
-    validation_datasets = all_data[int(len(all_data) * 0.9):]
+class CodeBlock(object):
+    def __init__(self, file_path:str, code_content:str):
+        """
+        Represents a block of code.
+        :param file_path: The path to the code file.
+        :param code_content: The content of the code block.
+        """
+        self.file_path:str = file_path
+        self.code_content:str = code_content
 
-    return training_datasets, validation_datasets
+    def __str__(self):
+        return self.code_content
+        
+class InputFeatures(object):
+    """A single training/test features for a example."""
+    def __init__(self,
+                 prefix_ids:List[int],
+                 suffix_ids:List[int],
+                 middle_ids:List[int] = None,
+                 query:str = None,
+                 document:List[CodeBlock] = None,
+    ):
+        self.prefix_ids = prefix_ids
+        self.middle_ids = middle_ids
+        self.suffix_ids = suffix_ids
+        self.query = query
+        self.document = document
+        
+class Benchmarks(dict):
+    def __init__(self, valid_dataset:List[Example], tokenizer:AutoTokenizer):
+        self.test_datasets = {
+            "github_projects": valid_dataset,
+            "ours_suffix": load_dataset("ours_suffix"),
+            "ours": load_dataset("ours"),
+            "cceval_python": load_dataset("cceval_python"),
+            "repoeval_line": load_dataset("repoeval_line")
+        }
+        self.test_featres = {}
+        self.tokenizer = tokenizer
+    
+    def __getitem__(self, key):
+        if key not in self.test_datasets.keys():
+            return None
+        if key not in self.test_featres:
+            features = []
+            for example in self.test_datasets[key]:
+                example:Example
+                features.append(convert_example_to_feature(example.prefix, example.suffix, example.middle, \
+                    example.relevant_code, self.tokenizer))
+            self.test_featres[key] = features
+        return features
+        
+def set_seed(seed=42):
+    random.seed(seed)
+    os.environ['PYHTONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
 
 def load_dataset(datasetname:str) -> List[Example]:
     """
@@ -78,44 +109,38 @@ def load_dataset(datasetname:str) -> List[Example]:
     
     return datasets
 
-class CodeBlock(object):
-    def __init__(self, file_path:str, code_content:str):
-        """
-        Represents a block of code.
-        :param file_path: The path to the code file.
-        :param code_content: The content of the code block.
-        """
-        self.file_path:str = file_path
-        self.code_content:str = code_content
+def convert_example_to_feature(prefix:str, suffix:str, middle:str, related_files:List[CodeBlock], tokenizer:PreTrainedTokenizer, args) -> InputFeatures:
+    
+    code_blocks:List[CodeBlock] = []
+    for file in related_files:
+        code_blocks.extend(split_into_smaller_blocks(file, args.enable_fixed_block))
+    
+    candidate_str = [x.code_content for x in code_blocks]
+    prefix_line = prefix.split("\n")
+    # TODO: set the query_line as a hyperparameter
+    if len(prefix_line) >= 15:
+        query_str = "\n".join(prefix_line[-15:])
+    else:
+        query_str = "\n".join(prefix_line)
+        suffix_line = suffix.split("\n")
+        query_str += "\n" + "\n".join(suffix_line[:15-len(prefix_line)])
+    candidate_num = args.relevant_code_num * 10
+    result = bm25_retrieve(query_str, candidate_str, tokenizer, k=candidate_num)
+    
+    related_codes = [code_blocks[x[1]] for x in result]
+    
+    prefix_tokenized_result = tokenizer(prefix, add_special_tokens=False)
+    suffix_tokenized_result = tokenizer(suffix, add_special_tokens=False)
+    middle_tokenized_result = tokenizer(middle, add_special_tokens=False)
 
-    def __str__(self):
-        return self.code_content
-    
-def label_line(code:str) -> List[Tuple[List[int], bool]]:
-    stack = []
-    line_map = []
-    line_count = 0
-    tokens = tokenize.generate_tokens(io.StringIO(code).readline)
-    
-    for token_type, string, start, _, _ in tokens:
-        # OP
-        if token_type == 54:
-            if string == '{' or string == '[' or string == '(':
-                stack.append(string)
-            elif string == '}' or string == ']' or string == ')':
-                stack.pop()
-                    
-        # NL
-        if token_type == 61 and len(stack) == 0:
-            line_map.append(([start[0] - 1], False))
-            line_count = start[0]
-        
-        # NEWLINE
-        elif token_type == 4:
-            line_map.append(([i - 1 for i in range(line_count+1, start[0]+1)], True))
-            line_count = start[0]
-    
-    return line_map
+    feature = InputFeatures(
+        prefix_tokenized_result["input_ids"],
+        suffix_tokenized_result["input_ids"],
+        middle_tokenized_result["input_ids"],
+        query_str,
+        related_codes
+    )
+    return feature
 
 def split_into_smaller_blocks(code_block:CodeBlock, enable_fixed_block:bool) -> List[CodeBlock]:
     """
@@ -219,24 +244,6 @@ def split_word(word:str) -> List[str]:
             
     return [word.lower() for word in words]
 
-# 模型生成的停止条件
-class StopAtSpecificTokenCriteria(StoppingCriteria):
-    def __init__(self, token_id_list: List[int]) -> None:
-        super().__init__()
-        self.token_id_list = token_id_list
-        
-    def __call__(self, input_ids: LongTensor, scores: FloatTensor, **kwargs):
-        return input_ids[0][-1].detach().cpu().numpy() in self.token_id_list
-
-# 获得所有以\n结尾的token_id
-def get_NL_list(tokenizer:AutoTokenizer) -> List[int]:
-    NL_list = []
-    for _, id in tokenizer.vocab.items():
-        token = tokenizer.decode(id)
-        if token.endswith("\n"):
-            NL_list.append(id)
-    return NL_list
-
 def bm25_retrieve(query_str:str, candidate_str:List[str], tokenizer:PreTrainedTokenizer, k:int):
     if k == 0:
         return []
@@ -247,7 +254,7 @@ def bm25_retrieve(query_str:str, candidate_str:List[str], tokenizer:PreTrainedTo
     result = bm25_model.top_k_sentence(query, k=k)
     return result
 
-def cross_file_contexts(related_codes:List[CodeBlock], tokenizer:PreTrainedTokenizer, cross_file_budget:int) -> Dict[str, List[int]]:
+def get_cross_file_context(related_codes:List[CodeBlock], tokenizer:PreTrainedTokenizer, cross_file_budget:int) -> Dict[str, List[int]]:
     filter_codeblocks = []
     for x in related_codes:
         file_path = x.file_path

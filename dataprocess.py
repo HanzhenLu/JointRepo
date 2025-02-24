@@ -2,12 +2,40 @@ import os
 import ast
 import random
 import pandas as pd
+import tokenize
+import io
 from typing import Dict, List, Tuple
 from tqdm import tqdm
 from transformers import AutoTokenizer
 from fastbm25 import fastbm25
 
-from utils.util import label_line, split_into_smaller_blocks, CodeBlock
+from utils.util import split_into_smaller_blocks, CodeBlock
+
+def label_line(code:str) -> List[Tuple[List[int], bool]]:
+    stack = []
+    line_map = []
+    line_count = 0
+    tokens = tokenize.generate_tokens(io.StringIO(code).readline)
+    
+    for token_type, string, start, _, _ in tokens:
+        # OP
+        if token_type == 54:
+            if string == '{' or string == '[' or string == '(':
+                stack.append(string)
+            elif string == '}' or string == ']' or string == ')':
+                stack.pop()
+                    
+        # NL
+        if token_type == 61 and len(stack) == 0:
+            line_map.append(([start[0] - 1], False))
+            line_count = start[0]
+        
+        # NEWLINE
+        elif token_type == 4:
+            line_map.append(([i - 1 for i in range(line_count+1, start[0]+1)], True))
+            line_count = start[0]
+    
+    return line_map
 
 def read_dir(dir:str) -> Dict[str, str]:
     content_map = {}
