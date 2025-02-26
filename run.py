@@ -6,7 +6,7 @@ import argparse
 import json
 import numpy as np
 from tqdm import tqdm
-from typing import List, Dict
+from typing import List
 from torch.utils.data import DataLoader, Dataset, RandomSampler
 from transformers import (AdamW, get_linear_schedule_with_warmup)
 
@@ -36,23 +36,25 @@ def DoNothingCollator(batch):
 
 def test(benchmark:Benchmarks, names:List[str], generator:Generator, retriever:Retriever, args, epoch:int):
     generator.eval()
+    retriever.eval()
     all_eval_examples = {name:benchmark[name] for name in names}
     for name, features in all_eval_examples.items():
         logger.info("Evaluating on {} dataset".format(name))
         decoder_features = []
-        for feature in features:
-            documents = retriever.retrieve(feature.query_str, feature.document, 
-                                                args.sampling_num, args.relevant_code_num, False)
-            decoder_features.append(
-                InputFeatures(
-                    feature.prefix_ids,
-                    feature.suffix_ids,
-                    feature.middle_ids,
-                    document=documents
+        with torch.no_grad():
+            for feature in features:
+                documents = retriever.retrieve(feature.query, feature.document, 
+                                                    args.sampling_num, args.relevant_code_num, False)
+                decoder_features.append(
+                    InputFeatures(
+                        feature.prefix_ids,
+                        feature.suffix_ids,
+                        feature.middle_ids,
+                        document=documents
+                    )
                 )
-            )
-            
-        generations = generator.generate(decoder_features, is_training=False)
+                
+            generations = generator.generate(decoder_features, is_training=False)
         if os.path.exists(f"{args.output_dir}/result_{epoch}/{name}") is False:
             os.makedirs(f"{args.output_dir}/result_{epoch}/{name}", exist_ok=True)
         with open(f"{args.output_dir}/result_{epoch}/{name}/prediction.jsonl", "w", encoding="utf-8") as f_pred:
@@ -67,18 +69,22 @@ def test(benchmark:Benchmarks, names:List[str], generator:Generator, retriever:R
         elif name == "ours_suffix":
             results = compute_metric_stmt(f"{args.output_dir}/result_{epoch}/{name}", "data/ours/python/test_suffix.jsonl")
         elif name == "github_projects":
-            targets, generations = ["".join(x.middle.split()) for x in features], ["".join(x.split()) for x in generations]
+            targets, generations = ["".join(x.middle.split()) for x in benchmark.test_datasets[name]], ["".join(x.split()) for x in generations]
             results = {}
             results["em"] = round(sum([1 if x[:min(len(y),len(x))] == y[:min(len(y),len(x))] else 0 for x,y in zip(generations, targets)])/len(generations)*100,4)
         else:
             raise Exception("unsupport test set")
         logger.info(f"{name} epoch {epoch}: {str(results)}")
-    if hasattr(generator, "module"):
-        model_to_save = generator.module
+    if hasattr(generator.model, "module"):
+        generator_to_save = generator.model.module
+        retriever_to_save = retriever.model.module
     else:
-        model_to_save = generator
-    torch.save(model_to_save.state_dict(), f"{args.output_dir}/result_{epoch}/model.pth")
+        generator_to_save = generator.model
+        retriever_to_save = retriever.model
+    torch.save(generator_to_save.state_dict(), f"{args.output_dir}/result_{epoch}/generator.pth")
+    torch.save(retriever_to_save.state_dict(), f"{args.output_dir}/result_{epoch}/retriever.pth")
     generator.train()
+    retriever.train()
 
 def main():
     parser = argparse.ArgumentParser()
@@ -102,6 +108,8 @@ def main():
                         help="Whether to run validation.")
     parser.add_argument("--do_test", action='store_true',
                         help="Whether to run validation.")
+    parser.add_argument("--debug", action='store_true',
+                        help="Whether to spped up training by reducing the size of training set")
     
     parser.add_argument("--train_batch_size", default=8, type=int,
                         help="Batch size per GPU/CPU for training.")
@@ -171,13 +179,18 @@ def main():
     
     if args.do_train:
         data = load_dataset(args.train_filename)
-        train_data = data[:int(len(data)*0.9)]
-        valid_data = data[int(len(data)*0.9):]
-        benchmark = Benchmarks(valid_data, generator.tokenizer)
+        if args.debug:
+            train_data = data[:int(len(data)*0.009)]
+            valid_data = data[int(len(data)*0.999):]
+        else:
+            train_data = data[:int(len(data)*0.9)]
+            valid_data = data[int(len(data)*0.9):]
+        benchmark = Benchmarks(valid_data, generator.tokenizer, args)
         train_features = []
-        for example in tqdm(train_data):
-            train_features.append(convert_example_to_feature(example.prefix, example.suffix, example.middle, \
-                example.relevant_code, generator.tokenizer, args))
+        for example in tqdm(train_data, desc="convert examples to features"):
+            train_feature = convert_example_to_feature(example.prefix, example.suffix, example.middle, \
+                example.relevant_code, generator.tokenizer, args)
+            train_features.append(train_feature)
         train_dataset = MyDataset(train_features)
         train_sampler = RandomSampler(train_dataset)
         train_dataloader = DataLoader(train_dataset, sampler=train_sampler, 
@@ -187,10 +200,12 @@ def main():
         # Prepare optimizer and schedule (linear warmup and decay) for generator
         no_decay = ['bias', 'LayerNorm.weight']
         optimizer_grouped_parameters = [
-            {'params': [p for n, p in generator.named_parameters() if not any(nd in n for nd in no_decay)],
+            {'params': [p for n, p in generator.model.named_parameters() if not any(nd in n for nd in no_decay)],
              'weight_decay': args.weight_decay},
-            {'params': [p for n, p in generator.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0},
-        ]
+            {'params': [p for n, p in generator.model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0},
+            {'params': [p for n, p in retriever.model.named_parameters() if not any(nd in n for nd in no_decay)],
+             'weight_decay': args.weight_decay},
+            {'params': [p for n, p in retriever.model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}        ]
         optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
         scheduler = get_linear_schedule_with_warmup(optimizer, 
                                                     num_warmup_steps=int(len(train_dataloader)*args.num_train_epochs*0.1),
@@ -205,10 +220,10 @@ def main():
         losses = []
         
         if args.do_valid:
-            test(benchmark, ["github_projects"], generator, generator.tokenizer, args, 0)
+            test(benchmark, ["github_projects"], generator, retriever, args, 0)
         
         for epoch in range(1, args.num_train_epochs+1):
-            for batch in train_dataloader:
+            for batch in tqdm(train_dataloader, desc=f"{epoch} epoch training", total=len(train_dataloader)):
                 generator.train()
                 retriever.train()
                 
@@ -216,7 +231,7 @@ def main():
                 # 检索并将所有东西组合成输入
                 for feature in batch:
                     feature:InputFeatures
-                    scores, documents_map = retriever.retrieve(feature.query_str, feature.document, 
+                    scores, documents_map = retriever.retrieve(feature.query, feature.document, 
                                                            args.sampling_num, args.relevant_code_num)
                     decoder_features = []
                     for _, documents in documents_map.items():
@@ -249,17 +264,20 @@ def main():
                     optimizer.zero_grad()
                     scheduler.step()
                     if len(losses) // args.gradient_accumulation_steps % 100 == 0:
+                        # 调整退火温度
+                        # TODO: 将退火温度也设置成一个超参数
+                        retriever.tau = min(0.01, retriever.tau * 0.95)
                         logger.info("epoch {} step {} loss {}".format(epoch,
                                                      len(losses)//args.gradient_accumulation_steps,
                                                      round(np.mean(losses[-100*args.gradient_accumulation_steps:]),4)))
         
             if args.do_valid:
-                test(benchmark, ["github_projects"], generator, args, epoch)
+                test(benchmark, ["github_projects"], generator, retriever, args, epoch)
     
     if args.do_test:
         
         testsets_name = ["ours_suffix", "ours", "cceval_python", "repoeval_line"]
-        test(benchmark, testsets_name, generator, args, 0 if not args.do_train else epoch)
+        test(benchmark, testsets_name, generator, retriever, args, 0 if not args.do_train else epoch)
                 
 if __name__ == '__main__':
     main()  

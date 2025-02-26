@@ -27,7 +27,7 @@ class CodeBlock(object):
         self.code_content:str = code_content
 
     def __str__(self):
-        return self.code_content
+        return f"#{self.file_path}/n{self.code_content}"
         
 class InputFeatures(object):
     """A single training/test features for a example."""
@@ -45,7 +45,7 @@ class InputFeatures(object):
         self.document = document
         
 class Benchmarks(dict):
-    def __init__(self, valid_dataset:List[Example], tokenizer:AutoTokenizer):
+    def __init__(self, valid_dataset:List[Example], tokenizer:AutoTokenizer, args):
         self.test_datasets = {
             "github_projects": valid_dataset,
             "ours_suffix": load_dataset("ours_suffix"),
@@ -53,19 +53,22 @@ class Benchmarks(dict):
             "cceval_python": load_dataset("cceval_python"),
             "repoeval_line": load_dataset("repoeval_line")
         }
-        self.test_featres = {}
+        self.test_features = {}
         self.tokenizer = tokenizer
+        self.args = args
     
     def __getitem__(self, key):
         if key not in self.test_datasets.keys():
             return None
-        if key not in self.test_featres:
+        if key not in self.test_features:
             features = []
             for example in self.test_datasets[key]:
                 example:Example
                 features.append(convert_example_to_feature(example.prefix, example.suffix, example.middle, \
-                    example.relevant_code, self.tokenizer))
-            self.test_featres[key] = features
+                    example.relevant_code, self.tokenizer, self.args))
+            self.test_features[key] = features
+        else:
+            features = self.test_features[key]
         return features
         
 def set_seed(seed=42):
@@ -91,6 +94,12 @@ def load_dataset(datasetname:str) -> List[Example]:
         data_frame = pd.concat(data_frame_parts)
     elif datasetname == "github_projects":
         data_frame = pd.read_json("data/github_projects/python/train.json")
+        # 打乱顺序
+        data_frame = data_frame.sample(frac=1).reset_index(drop=True)
+    elif datasetname == "github_repos":
+        data_frame = pd.read_parquet("data/github_repos/python/train.parquet")
+        # 打乱顺序
+        data_frame = data_frame.sample(frac=1).reset_index(drop=True)
     elif datasetname == "ours":
         data_frame = pd.read_parquet("data/ours/python/test.parquet")
     elif datasetname == "ours_suffix":
@@ -100,7 +109,7 @@ def load_dataset(datasetname:str) -> List[Example]:
 
     datasets = []
     for item in data_frame[["task_id", "path", "left_context", "right_context", "crossfile_context", "groundtruth"]].values:
-        cross_files = item[4] if len(item[4]) > 0 else [{'path': "", "text": "Don't need cross file context for completion"}]
+        cross_files = item[4]
         cross_files = [CodeBlock(x["path"], x["text"]) for x in cross_files]
         if datasetname == "repoeval_line":
             datasets.append(Example(item[0], item[2]+"\n", item[3], item[5], cross_files))
@@ -124,10 +133,13 @@ def convert_example_to_feature(prefix:str, suffix:str, middle:str, related_files
         query_str = "\n".join(prefix_line)
         suffix_line = suffix.split("\n")
         query_str += "\n" + "\n".join(suffix_line[:15-len(prefix_line)])
-    candidate_num = args.relevant_code_num * 10
+    
+    candidate_num = args.relevant_code_num * 5
     result = bm25_retrieve(query_str, candidate_str, tokenizer, k=candidate_num)
     
     related_codes = [code_blocks[x[1]] for x in result]
+    for i in range(args.relevant_code_num):
+        related_codes.append(CodeBlock("Unknown", f"# Don't need crossfile {i}"))
     
     prefix_tokenized_result = tokenizer(prefix, add_special_tokens=False)
     suffix_tokenized_result = tokenizer(suffix, add_special_tokens=False)
@@ -172,7 +184,7 @@ def split_into_smaller_blocks(code_block:CodeBlock, enable_fixed_block:bool) -> 
         if current_block: 
             mini_blocks.append(current_block)
 
-        # 超过12行的block划分成多个block
+        # 超过15行的block划分成多个block
         max_len = 15
         temp_mini_blocks = []
         for mini_block in mini_blocks:
@@ -183,6 +195,7 @@ def split_into_smaller_blocks(code_block:CodeBlock, enable_fixed_block:bool) -> 
                 temp_mini_blocks.append(mini_block)
         mini_blocks = temp_mini_blocks
 
+        # combine two code block into a larger code block
         current_content = []
         total_lines = 0  
         for block in mini_blocks:
@@ -245,7 +258,7 @@ def split_word(word:str) -> List[str]:
     return [word.lower() for word in words]
 
 def bm25_retrieve(query_str:str, candidate_str:List[str], tokenizer:PreTrainedTokenizer, k:int):
-    if k == 0:
+    if k == 0 or len(candidate_str) == 0:
         return []
     # TODO: 将检索使用的token数量设置为一个参数
     tokenized_corpus = [tokenizer.tokenize(doc)[:200] for doc in candidate_str]
@@ -260,7 +273,7 @@ def get_cross_file_context(related_codes:List[CodeBlock], tokenizer:PreTrainedTo
         file_path = x.file_path
         code_content = x.code_content
         # TODO: 真的需要把file path也附加上去吗
-        if file_path != "":
+        if file_path != "" and file_path != "Unknown":
             filter_codeblocks.append(f"#{file_path}\n{code_content}" if code_content.endswith("\n") else f"#{file_path}\n{code_content}\n")
         else:
             break
@@ -279,3 +292,15 @@ def get_cross_file_context(related_codes:List[CodeBlock], tokenizer:PreTrainedTo
         related_idx += 1
     
     return repo_content
+
+def check_memory():
+    # 获取当前 GPU 的显存占用（单位：字节）
+    allocated = torch.cuda.memory_allocated()  # 当前分配的显存
+    reserved = torch.cuda.memory_reserved()    # 缓存分配的显存（PyTorch 内部管理）
+
+    # 转换为更友好的单位（如 MB）
+    allocated_mb = allocated / 1024**3
+    reserved_mb = reserved / 1024**3
+
+    print(f"当前显存占用: {allocated_mb:.2f} GB")
+    print(f"PyTorch 保留的显存: {reserved_mb:.2f} GB")

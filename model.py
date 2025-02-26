@@ -9,7 +9,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel
 from typing import Tuple, List, Union, Dict
 from torch.nn import CrossEntropyLoss
 
-from utils.util import (get_cross_file_context, 
+from utils.util import (get_cross_file_context,
                         CodeBlock, InputFeatures)
 
 logger = logging.getLogger(__name__)
@@ -17,11 +17,12 @@ logger = logging.getLogger(__name__)
 class Retriever:
     def __init__(self, model_name_or_path:str):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
-        self.model = AutoModel.from_pretrained(model_name_or_path, add_pooling_layer=False)
+        self.model = AutoModel.from_pretrained(model_name_or_path,  add_pooling_layer=False)
         self.tau = 1.0
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     def embedding(self, input_str:Union[str, List[str]]) -> torch.Tensor:
-        input_ids = self.tokenizer(input_str, padding=True, truncation=True, return_tensors='pt', max_length=512)
+        input_ids = self.tokenizer(input_str, padding=True, truncation=True, return_tensors='pt', max_length=512).to(self.device)
         embedding = self.model(**input_ids)[0][:, 0]
         return embedding
     
@@ -37,15 +38,18 @@ class Retriever:
         '''
         # 提供的文档数可能小于需要的文档数
         n = min(n, len(documents))
+        # 如果只有一个候选项的话采样一次就够了
+        if len(documents) == 1:
+            k = 1
         
         query_embedding = self.embedding(query_str)
         document_embedding = self.embedding([doc.code_content for doc in documents])
-        scores = torch.matmul(query_embedding, document_embedding.T)
+        scores = torch.matmul(query_embedding, document_embedding.T).squeeze(dim=0)
         
         permutations = list(itertools.permutations(range(len(documents)), n))
         perm_tensor = torch.tensor(permutations)
         
-        position_weights = torch.tensor([1/(i+1) for i in range(n)])
+        position_weights = torch.tensor([1/(i+1) for i in range(n)]).to(scores.device)
         
         selected_scores = scores[perm_tensor]
         # 因为这里已经将所有被检索目标的分数都添加到一起了，
@@ -70,10 +74,16 @@ class Retriever:
         
         return sum, samples
     
+    def eval(self):
+        self.model.eval()
+        
+    def train(self):
+        self.model.train()
+    
 class Generator:
     def __init__(self, model_name_or_path:str, args):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
-        self.model = AutoModelForCausalLM.from_pretrained(model_name_or_path, add_pooling_layer=False)
+        self.model = AutoModelForCausalLM.from_pretrained(model_name_or_path)
         # 特殊标记ID映射
         # TODO: 这需要根据模型进行改动
         self.special_token_ids = {
@@ -82,6 +92,7 @@ class Generator:
             "middle_id": self.tokenizer.convert_tokens_to_ids("<MIDDLE>")
         }
         self.args = args
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     def generate(self, input_batch:List[InputFeatures], is_training:bool):
         batch_input_ids = []
@@ -92,7 +103,10 @@ class Generator:
             cross_file_context = get_cross_file_context(feature.document, self.tokenizer, self.args.max_crossfile_length)
             
             # 计算分配长度
-            max_allocated_length = self.args.max_input_length - len(cross_file_context["input_ids"]) - 3
+            if is_training:
+                max_allocated_length = self.args.max_input_length - len(cross_file_context["input_ids"]) - len(feature.middle_ids) - 4
+            else:
+                max_allocated_length = self.args.max_input_length - len(cross_file_context["input_ids"]) - 3
             prefix_length = max_allocated_length // 2
             suffix_length = max_allocated_length - prefix_length
             if len(feature.prefix_ids) < prefix_length and len(feature.suffix_ids) < suffix_length:
@@ -136,10 +150,10 @@ class Generator:
                 batch_input_ids.append(input_ids)
                 batch_attention_mask.append(attention_mask)
         
-        input_tensor = torch.tensor(batch_input_ids, dtype=torch.long).to(self.model.device)
-        attention_tensor = torch.tensor(batch_attention_mask, dtype=torch.bool).to(self.model.device)
+        input_tensor = torch.tensor(batch_input_ids, dtype=torch.long).to(self.device)
+        attention_tensor = torch.tensor(batch_attention_mask, dtype=torch.bool).to(self.device)
         if is_training:
-            label_tensor = torch.tensor(batch_labels, dtype=torch.long).to(self.model.device)
+            label_tensor = torch.tensor(batch_labels, dtype=torch.long).to(self.device)
             outputs = self.model(input_ids=input_tensor,
                                 attention_mask=attention_tensor,
                                 labels=label_tensor)
@@ -147,18 +161,30 @@ class Generator:
             batch_logits = outputs.logits
             loss_fct = CrossEntropyLoss()
             loss_list = []
-            for logits, labels in zip(batch_logits, batch_labels):
+            for logits, labels in zip(batch_logits, label_tensor):
                 loss_list.append(loss_fct(logits, labels))
             
             return loss_list
         else:
             batch_generated_ids = []
-            pbar = tqdm(zip(input_tensor, attention_tensor), desc="Generating")
+            pbar = tqdm(zip(input_tensor, attention_tensor), desc="Generating", total=len(input_tensor))
             for input_ids, attention_mask in pbar:
-                generated_ids = self.model.generate(input_ids, attention_mask=attention_mask, 
+                input_ids = input_ids.unsqueeze(dim=0)
+                attention_mask = attention_mask.unsqueeze(dim=0)
+                if hasattr(self.model, "module"):
+                    model_to_generate = self.model.module
+                else:
+                    model_to_generate = self.model
+                generated_ids = model_to_generate.generate(input_ids, attention_mask=attention_mask, 
                     max_length=input_ids.size(1)+self.args.max_generation_length, pad_token_id=self.tokenizer.pad_token_id)
-                batch_generated_ids.append(generated_ids[:, input_ids.size(1):])
+                batch_generated_ids.extend(generated_ids[:, input_ids.size(1):])
             return [self.tokenizer.decode(generated_id, skip_special_tokens=True) for generated_id in batch_generated_ids]
+        
+    def eval(self):
+        self.model.eval()
+        
+    def train(self):
+        self.model.train()
             
 def get_model_size(model):
     model_parameters = filter(lambda p: p.requires_grad, model.parameters())
@@ -168,10 +194,10 @@ def get_model_size(model):
 
 def build_model(args) -> Tuple[Generator, Retriever]:
     generator = Generator(args.generator_name_or_path, args)
-
-    logger.info("Finish loading generator [%s] from %s", get_model_size(generator.model), args.generator_name_or_path)
-
     retriever = Retriever(args.retriever_name_or_path)
+    
+    logger.info("Finish loading generator [%s] from %s", get_model_size(generator.model), args.generator_name_or_path)
+    logger.info("Finish loading retriever [%s] from %s", get_model_size(retriever.model), args.retriever_name_or_path)
     
     generator.model.to(args.device)  
     retriever.model.to(args.device)
