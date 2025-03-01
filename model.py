@@ -6,8 +6,7 @@ import torch
 import itertools
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel
-from typing import Tuple, List, Union, Dict
-from torch.nn import CrossEntropyLoss
+from typing import Tuple, List, Union, Dict, Sequence
 
 from utils.util import (get_cross_file_context,
                         CodeBlock, InputFeatures)
@@ -21,7 +20,11 @@ class Retriever:
         self.tau = 1.0
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    def embedding(self, input_str:Union[str, List[str]]) -> torch.Tensor:
+    def embedding(self, input_str:Union[str, List[str]], is_query:bool) -> torch.Tensor:
+        if is_query:
+            self.tokenizer.truncation_side = "left"
+        else:
+            self.tokenizer.truncation_side = "right"
         input_ids = self.tokenizer(input_str, padding=True, truncation=True, return_tensors='pt', max_length=512).to(self.device)
         embedding = self.model(**input_ids)[0][:, 0]
         return embedding
@@ -42,8 +45,8 @@ class Retriever:
         if len(documents) == 1:
             k = 1
         
-        query_embedding = self.embedding(query_str)
-        document_embedding = self.embedding([doc.code_content for doc in documents])
+        query_embedding = self.embedding(query_str, True)
+        document_embedding = self.embedding([doc.code_content for doc in documents], False)
         scores = torch.matmul(query_embedding, document_embedding.T).squeeze(dim=0)
         
         permutations = list(itertools.permutations(range(len(documents)), n))
@@ -79,6 +82,39 @@ class Retriever:
         
     def train(self):
         self.model.train()
+        
+class UnixcoderForRetriever(Retriever):
+    def __init__(self, model_name_or_path:str):
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+        self.model = AutoModel.from_pretrained(model_name_or_path)
+        self.model = torch.nn.DataParallel(self.model).cuda()
+        
+    def tokenize(self, input_str, is_query):
+        tokens = self.tokenizer.tokenize(input_str)
+        max_length = 512
+        if is_query:
+            tokens = tokens[-(max_length - 4):]
+        else:
+            tokens = tokens[:(max_length - 4)]
+        tokens = [self.tokenizer.cls_token, "<encoder-only>", self.tokenizer.sep_token] \
+            + tokens + [self.tokenizer.sep_token]
+        tokens_id = self.tokenizer.convert_tokens_to_ids(tokens)
+        padding_length = max_length - len(tokens_id)
+        tokens_id += [self.tokenizer.pad_token_id] * padding_length
+        return tokens_id
+        
+    def embedding(self, input_str, is_query):
+        if not isinstance(input_str, str):
+            source_ids = [self.tokenize(string, is_query) for string in input_str]
+        else:
+            source_ids = self.tokenize(input_str, is_query)
+        
+        source_ids = torch.tensor(source_ids, dtype=torch.long).to("cuda")
+        mask = source_ids.ne(self.tokenizer.pad_token_id).to("cuda")
+        token_embeddings = self.model(source_ids, attention_mask=mask)[0]
+        sentence_embeddings = (token_embeddings * mask.unsqueeze(-1)).sum(1) / mask.sum(-1).unsqueeze(-1)
+        sentence_embeddings = torch.nn.functional.normalize(sentence_embeddings, p=2, dim=1)
+        return sentence_embeddings
     
 class Generator:
     def __init__(self, model_name_or_path:str, args):
@@ -159,12 +195,16 @@ class Generator:
                                 labels=label_tensor)
             
             batch_logits = outputs.logits
-            loss_fct = CrossEntropyLoss()
-            loss_list = []
-            for logits, labels in zip(batch_logits, label_tensor):
-                loss_list.append(loss_fct(logits, labels))
+            loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
+
+            per_position_loss = loss_fct(
+                batch_logits.view(-1, batch_logits.size(-1)),
+                label_tensor.view(-1)
+            ).view(batch_logits.size(0), batch_logits.size(1))
+
+            per_sample_loss = per_position_loss.mean(dim=1)
+            return per_sample_loss
             
-            return loss_list
         else:
             batch_generated_ids = []
             pbar = tqdm(zip(input_tensor, attention_tensor), desc="Generating", total=len(input_tensor))
@@ -194,7 +234,11 @@ def get_model_size(model):
 
 def build_model(args) -> Tuple[Generator, Retriever]:
     generator = Generator(args.generator_name_or_path, args)
-    retriever = Retriever(args.retriever_name_or_path)
+    if "unixocder" in args.retriever_name_or_path.lower():
+        logger.info("Using child class UnixcoderForRetriever !!!")
+        retriever = UnixcoderForRetriever(args.retriever_name_or_path)
+    else:
+        retriever = Retriever(args.retriever_name_or_path)
     
     logger.info("Finish loading generator [%s] from %s", get_model_size(generator.model), args.generator_name_or_path)
     logger.info("Finish loading retriever [%s] from %s", get_model_size(retriever.model), args.retriever_name_or_path)

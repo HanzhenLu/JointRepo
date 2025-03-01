@@ -76,12 +76,9 @@ def test(benchmark:Benchmarks, names:List[str], generator:Generator, retriever:R
             raise Exception("unsupport test set")
         logger.info(f"{name} epoch {epoch}: {str(results)}")
     if hasattr(generator.model, "module"):
-        generator_to_save = generator.model.module
         retriever_to_save = retriever.model.module
     else:
-        generator_to_save = generator.model
         retriever_to_save = retriever.model
-    torch.save(generator_to_save.state_dict(), f"{args.output_dir}/result_{epoch}/generator.pth")
     torch.save(retriever_to_save.state_dict(), f"{args.output_dir}/result_{epoch}/retriever.pth")
     generator.train()
     retriever.train()
@@ -200,18 +197,16 @@ def main():
         # Prepare optimizer and schedule (linear warmup and decay) for generator
         no_decay = ['bias', 'LayerNorm.weight']
         optimizer_grouped_parameters = [
-            {'params': [p for n, p in generator.model.named_parameters() if not any(nd in n for nd in no_decay)],
-             'weight_decay': args.weight_decay},
-            {'params': [p for n, p in generator.model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0},
             {'params': [p for n, p in retriever.model.named_parameters() if not any(nd in n for nd in no_decay)],
              'weight_decay': args.weight_decay},
-            {'params': [p for n, p in retriever.model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}        ]
+            {'params': [p for n, p in retriever.model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+        ]
         optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
         scheduler = get_linear_schedule_with_warmup(optimizer, 
                                                     num_warmup_steps=int(len(train_dataloader)*args.num_train_epochs*0.1),
                                                     num_training_steps=len(train_dataloader)*args.num_train_epochs)
         
-        #Start training
+        # Start training
         logger.info("***** Running training *****")
         logger.info("  Num examples = %d", len(train_features))
         logger.info("  Batch size = %d", args.train_batch_size * args.gradient_accumulation_steps)
@@ -224,35 +219,32 @@ def main():
         
         for epoch in range(1, args.num_train_epochs+1):
             for batch in tqdm(train_dataloader, desc=f"{epoch} epoch training", total=len(train_dataloader)):
-                generator.train()
+                generator.eval()
                 retriever.train()
                 
                 loss = None
-                # 检索并将所有东西组合成输入
                 for feature in batch:
                     feature:InputFeatures
                     scores, documents_map = retriever.retrieve(feature.query, feature.document, 
                                                            args.sampling_num, args.relevant_code_num)
-                    decoder_features = []
-                    for _, documents in documents_map.items():
-                        decoder_features.append(
-                            InputFeatures(
-                                feature.prefix_ids,
-                                feature.suffix_ids,
-                                feature.middle_ids,
-                                document=documents
-                            )
+                    decoder_features = [
+                        InputFeatures(
+                            feature.prefix_ids,
+                            feature.suffix_ids,
+                            feature.middle_ids,
+                            document=documents
                         )
-                    feature_loss = generator.generate(decoder_features, True)
+                        for documents in documents_map.values()
+                    ]
                     
-                    permutation_loss = torch.zeros_like(scores)
-                    for i, (permutation_idx, _) in enumerate(documents_map.items()):
-                        permutation_loss[permutation_idx] += feature_loss[i]
+                    with torch.no_grad():
+                        feature_loss = generator.generate(decoder_features, True)
                     
-                    if loss is None:
-                        loss = torch.sum(permutation_loss * scores)
-                    else:
-                        loss += torch.sum(permutation_loss * scores)
+                    permutation_indices = torch.tensor(list(documents_map.keys()), device=device)
+                    permutation_scores = scores[permutation_indices]
+                    
+                    current_loss = torch.dot(permutation_scores, feature_loss)
+                    loss = current_loss if loss is None else loss + current_loss
                 
                 if args.gradient_accumulation_steps > 1:
                     loss = loss / args.gradient_accumulation_steps
