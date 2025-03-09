@@ -6,7 +6,7 @@ import torch
 import itertools
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel
-from typing import Tuple, List, Union, Dict, Sequence
+from typing import Tuple, List, Union, Dict
 
 from utils.util import (get_cross_file_context,
                         CodeBlock, InputFeatures)
@@ -15,8 +15,11 @@ logger = logging.getLogger(__name__)
 
 class Retriever:
     def __init__(self, model_name_or_path:str):
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
-        self.model = AutoModel.from_pretrained(model_name_or_path,  add_pooling_layer=False)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
+        if "snowflake" in model_name_or_path.lower():
+            self.model = AutoModel.from_pretrained(model_name_or_path, add_pooling_layer=False, trust_remote_code=True)
+        else:
+            self.model = AutoModel.from_pretrained(model_name_or_path, trust_remote_code=True)
         self.tau = 1.0
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -27,6 +30,7 @@ class Retriever:
             self.tokenizer.truncation_side = "right"
         input_ids = self.tokenizer(input_str, padding=True, truncation=True, return_tensors='pt', max_length=512).to(self.device)
         embedding = self.model(**input_ids)[0][:, 0]
+        embedding = torch.nn.functional.normalize(embedding, p=2, dim=1)
         return embedding
     
     def retrieve(self, query_str:str, documents:List[CodeBlock], k:int, n:int, is_training:bool=True) \
@@ -72,7 +76,7 @@ class Retriever:
             permutation_id = torch.argmax(soft_samples, dim=-1).cpu()
             doc_ids = permutations[permutation_id]
             if permutation_id not in samples:
-                samples[permutation_id] = [documents[i] for i in doc_ids]
+                samples[permutation_id.item()] = [documents[i] for i in doc_ids]
             sum += soft_samples
         
         return sum, samples
@@ -113,6 +117,19 @@ class UnixcoderForRetriever(Retriever):
         mask = source_ids.ne(self.tokenizer.pad_token_id).to("cuda")
         token_embeddings = self.model(source_ids, attention_mask=mask)[0]
         sentence_embeddings = (token_embeddings * mask.unsqueeze(-1)).sum(1) / mask.sum(-1).unsqueeze(-1)
+        sentence_embeddings = torch.nn.functional.normalize(sentence_embeddings, p=2, dim=1)
+        return sentence_embeddings
+
+class JinaForRetriever(Retriever):
+    def __init__(self, model_name_or_path:str):
+        self.model = AutoModel.from_pretrained(model_name_or_path, trust_remote_code=True)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+    def embedding(self, input_str, is_query):
+        sentence_embeddings = self.model.encode(input_str)
+        sentence_embeddings = torch.tensor(sentence_embeddings)
+        if isinstance(input_str, str):
+            sentence_embeddings = sentence_embeddings.unsqueeze(0)
         sentence_embeddings = torch.nn.functional.normalize(sentence_embeddings, p=2, dim=1)
         return sentence_embeddings
     
@@ -237,16 +254,24 @@ def build_model(args) -> Tuple[Generator, Retriever]:
     if "unixocder" in args.retriever_name_or_path.lower():
         logger.info("Using child class UnixcoderForRetriever !!!")
         retriever = UnixcoderForRetriever(args.retriever_name_or_path)
+    elif "jina" in args.retriever_name_or_path.lower():
+        logger.info("Using child class JinaForRetriever !!!")
+        retriever = JinaForRetriever(args.retriever_name_or_path)
+    elif args.retriever_name_or_path is None:
+        retriever = None
     else:
         retriever = Retriever(args.retriever_name_or_path)
     
-    logger.info("Finish loading generator [%s] from %s", get_model_size(generator.model), args.generator_name_or_path)
-    logger.info("Finish loading retriever [%s] from %s", get_model_size(retriever.model), args.retriever_name_or_path)
-    
     generator.model.to(args.device)  
-    retriever.model.to(args.device)
+    logger.info("Finish loading generator [%s] from %s", get_model_size(generator.model), args.generator_name_or_path)
+    
+    if retriever is not None:
+        retriever.model.to(args.device)
+        logger.info("Finish loading retriever [%s] from %s", get_model_size(retriever.model), args.retriever_name_or_path)
+    
     if args.n_gpu > 1:
         generator.model = torch.nn.DataParallel(generator.model)
-        retriever.model = torch.nn.DataParallel(retriever.model)
+        if retriever is not None:
+            retriever.model = torch.nn.DataParallel(retriever.model)
     
     return generator, retriever

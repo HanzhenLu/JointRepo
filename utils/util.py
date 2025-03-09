@@ -4,6 +4,7 @@ import re
 import os
 import torch
 import numpy as np
+from tqdm import tqdm
 from fastbm25 import fastbm25
 from typing import List, Dict
 from transformers import PreTrainedTokenizer, AutoTokenizer
@@ -27,7 +28,7 @@ class CodeBlock(object):
         self.code_content:str = code_content
 
     def __str__(self):
-        return f"#{self.file_path}/n{self.code_content}"
+        return f"#{self.file_path}\n{self.code_content}"
         
 class InputFeatures(object):
     """A single training/test features for a example."""
@@ -62,7 +63,7 @@ class Benchmarks(dict):
             return None
         if key not in self.test_features:
             features = []
-            for example in self.test_datasets[key]:
+            for example in tqdm(self.test_datasets[key], desc=f"convert {key} into features"):
                 example:Example
                 features.append(convert_example_to_feature(example.prefix, example.suffix, example.middle, \
                     example.relevant_code, self.tokenizer, self.args))
@@ -94,12 +95,8 @@ def load_dataset(datasetname:str) -> List[Example]:
         data_frame = pd.concat(data_frame_parts)
     elif datasetname == "github_projects":
         data_frame = pd.read_json("data/github_projects/python/train.json")
-        # 打乱顺序
-        data_frame = data_frame.sample(frac=1).reset_index(drop=True)
     elif datasetname == "github_repos":
         data_frame = pd.read_parquet("data/github_repos/python/train.parquet")
-        # 打乱顺序
-        data_frame = data_frame.sample(frac=1).reset_index(drop=True)
     elif datasetname == "ours":
         data_frame = pd.read_parquet("data/ours/python/test.parquet")
     elif datasetname == "ours_suffix":

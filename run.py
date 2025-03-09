@@ -5,6 +5,7 @@ import logging
 import argparse
 import json
 import numpy as np
+import pickle
 from tqdm import tqdm
 from typing import List
 from torch.utils.data import DataLoader, Dataset, RandomSampler
@@ -171,6 +172,20 @@ def main():
 
     # build model
     generator, retriever = build_model(args)
+    testsets_name = [
+        "ours_suffix", 
+        "ours", 
+        "cceval_python", 
+        "repoeval_line"
+    ]
+    
+    generator_name = args.generator_name_or_path.split('/')[-1]
+    benchmark_ckp = f"intermediate/{args.sampling_num}-{generator_name}.pkl"
+    benchmark = Benchmarks(None, generator.tokenizer, args)
+    if os.path.exists(benchmark_ckp):
+        with open(benchmark_ckp, "rb") as f:
+            benchmark.test_features = pickle.load(f)
+            benchmark.test_features.pop("github_projects", None)
     
     logger.info("Training/evaluation parameters %s", args)
     
@@ -182,7 +197,7 @@ def main():
         else:
             train_data = data[:int(len(data)*0.9)]
             valid_data = data[int(len(data)*0.9):]
-        benchmark = Benchmarks(valid_data, generator.tokenizer, args)
+        benchmark.test_datasets["github_projects"] = valid_data
         train_features = []
         for example in tqdm(train_data, desc="convert examples to features"):
             train_feature = convert_example_to_feature(example.prefix, example.suffix, example.middle, \
@@ -215,10 +230,13 @@ def main():
         losses = []
         
         if args.do_valid:
-            test(benchmark, ["github_projects"], generator, retriever, args, 0)
+            test(benchmark, ["github_projects"] + testsets_name, generator, retriever, args, 0)
+            if not os.path.exists(benchmark_ckp):
+                with open(benchmark_ckp, "wb") as f:
+                    pickle.dump(benchmark.test_features, f)
         
         for epoch in range(1, args.num_train_epochs+1):
-            for batch in tqdm(train_dataloader, desc=f"{epoch} epoch training", total=len(train_dataloader)):
+            for batch in train_dataloader:
                 generator.eval()
                 retriever.train()
                 
@@ -242,6 +260,7 @@ def main():
                     
                     permutation_indices = torch.tensor(list(documents_map.keys()), device=device)
                     permutation_scores = scores[permutation_indices]
+                    assert torch.all(permutation_scores != 0)
                     
                     current_loss = torch.dot(permutation_scores, feature_loss)
                     loss = current_loss if loss is None else loss + current_loss
@@ -264,12 +283,13 @@ def main():
                                                      round(np.mean(losses[-100*args.gradient_accumulation_steps:]),4)))
         
             if args.do_valid:
-                test(benchmark, ["github_projects"], generator, retriever, args, epoch)
+                test(benchmark, ["github_projects"] + testsets_name, generator, retriever, args, epoch)
     
     if args.do_test:
-        
-        testsets_name = ["ours_suffix", "ours", "cceval_python", "repoeval_line"]
         test(benchmark, testsets_name, generator, retriever, args, 0 if not args.do_train else epoch)
+        if not os.path.exists(benchmark_ckp):
+            with open(benchmark_ckp, "wb") as f:
+                pickle.dump(benchmark.test_features, f)
                 
 if __name__ == '__main__':
     main()  

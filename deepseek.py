@@ -12,8 +12,8 @@ from typing import List, Tuple, Dict
 from torch.utils.data import DataLoader, Dataset, SequentialSampler
 from transformers import (PreTrainedTokenizer, PreTrainedModel)
 
-from utils.util import (load_dataset, CodeBlock, split_into_smaller_blocks, Example)
-from model import build_model
+from utils.util import (load_dataset, split_into_smaller_blocks, CodeBlock, Example)
+from model import build_model, Retriever, Generator
 from eval import compute_metric_stmt
 
 logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
@@ -51,11 +51,12 @@ class CustomDataset(Dataset):
         retrieved_codeblocks: Retrieved code blocks.
     """
     
-    def __init__(self, args, tokenizer, examples) -> None:
+    def __init__(self, args, tokenizer, retriever, examples) -> None:
         super().__init__()
         self.args = args
         self.tokenizer = tokenizer
-        self.examples = examples
+        self.examples:List[Example] = examples
+        self.retriever:Retriever = retriever
         self.special_tokens = {
             "prefix_id": tokenizer.convert_tokens_to_ids("<｜fim▁begin｜>"),
             "suffix_id": tokenizer.convert_tokens_to_ids("<｜fim▁end｜>"),
@@ -77,18 +78,26 @@ class CustomDataset(Dataset):
             code_blocks.extend(split_into_smaller_blocks(file, self.args.enable_fixed_block))
             
         tokenized_corpus = [self.tokenizer.tokenize(doc.code_content) for doc in code_blocks]
-        bm25_model = fastbm25(tokenized_corpus)
-        prefix_line = prefix.split("\n")
-        # TODO: set the query_line as a hyperparameter
-        if len(prefix_line) >= 15:
-            query = "\n".join(prefix_line[-15:])
+        if len(tokenized_corpus) != 0:
+            bm25_model = fastbm25(tokenized_corpus)
+            prefix_line = prefix.split("\n")
+            # TODO: set the query_line as a hyperparameter
+            if len(prefix_line) >= 15:
+                query_str = "\n".join(prefix_line[-15:])
+            else:
+                query_str = "\n".join(prefix_line)
+                suffix_line = suffix.split("\n")
+                query_str += "\n" + "\n".join(suffix_line[:15-len(prefix_line)])
+            query = self.tokenizer.tokenize(query_str)
+            if self.retriever is None:
+                result = bm25_model.top_k_sentence(query, k=self.args.relevant_code_num)
+                retrieved_codeblocks = [code_blocks[x[1]] for x in result]
+            else:
+                result = bm25_model.top_k_sentence(query, k=self.args.relevant_code_num * 5)
+                retrieved_codeblocks = self.retriever.retrieve(query_str, [code_blocks[x[1]] for x in result], 1,\
+                    self.args.relevant_code_num, False)
         else:
-            query = "\n".join(prefix_line)
-            suffix_line = suffix.split("\n")
-            query += "\n" + "\n".join(suffix_line[:15-len(prefix_line)])
-        query = self.tokenizer.tokenize(query)
-        result = bm25_model.top_k_sentence(query, k=self.args.relevant_code_num)
-        retrieved_codeblocks = [code_blocks[x[1]] for x in result]
+            retrieved_codeblocks = []
         
         filter_codeblocks = []
         for x in retrieved_codeblocks:
@@ -155,25 +164,25 @@ class CustomDataset(Dataset):
         input_ids, attention_mask = self.construct_prompt(example).values()
         return torch.tensor(input_ids), torch.tensor(attention_mask)
 
-def generate(args, generator:PreTrainedModel, tokenizer:PreTrainedTokenizer, examples:List[Example]) -> List[str]:
+def generate(args, generator:Generator, retriever:Retriever, examples:List[Example]) -> List[str]:
     generated_codes = []
-    dataset = CustomDataset(args, tokenizer, examples)
+    dataset = CustomDataset(args, generator.tokenizer, retriever, examples)
     sampler = SequentialSampler(dataset)
     # TODO: set the num_workers as a hyperparameter
-    dataloader = DataLoader(dataset, sampler=sampler, batch_size=args.eval_batch_size, num_workers=20)
+    dataloader = DataLoader(dataset, sampler=sampler, batch_size=args.eval_batch_size)
     pbar = tqdm(dataloader, desc="Generating")
     with torch.no_grad():
         for batch in pbar:
             input_ids, attention_mask = [x.to(generator.device) for x in batch]
-            generated_ids = generator.generate(input_ids, attention_mask=attention_mask, 
-                max_length=input_ids.size(1)+args.max_generation_length, pad_token_id=tokenizer.pad_token_id)
+            generated_ids = generator.model.generate(input_ids, attention_mask=attention_mask, 
+                max_length=input_ids.size(1)+args.max_generation_length, pad_token_id=generator.tokenizer.pad_token_id)
             generated_codes.extend(generated_ids[:, input_ids.size(1):])
-    return [tokenizer.decode(generated_id, skip_special_tokens=True) for generated_id in generated_codes]
+    return [generator.tokenizer.decode(generated_id, skip_special_tokens=True) for generated_id in generated_codes]
 
-def test(all_eval_examples:Dict[str, List[Example]], generator:PreTrainedModel, tokenizer:PreTrainedTokenizer, args, epoch:int):
+def test(all_eval_examples:Dict[str, List[Example]], generator:PreTrainedModel, retriever:Retriever, args, epoch:int):
     for name, examples in all_eval_examples.items():
         logger.info("Evaluating on {} dataset".format(name))
-        generations = generate(args, generator, tokenizer, examples)
+        generations = generate(args, generator, retriever, examples)
         if os.path.exists(f"{args.output_dir}/result_{epoch}/{name}") is False:
             os.makedirs(f"{args.output_dir}/result_{epoch}/{name}", exist_ok=True)
         with open(f"{args.output_dir}/result_{epoch}/{name}/prediction.jsonl", "w", encoding="utf-8") as f_pred:
@@ -198,8 +207,10 @@ def main():
     parser = argparse.ArgumentParser()
 
     ## Required parameters  
-    parser.add_argument("--model_name_or_path", default=None, type=str, required=True,
+    parser.add_argument("--generator_name_or_path", default=None, type=str, required=True,
                         help="Path to pre-trained model: e.g. roberta-base" )   
+    parser.add_argument("--retriever_name_or_path", default=None, type=str,
+                        help="Path to retrieval model: e.g. unixcoder" )   
     parser.add_argument("--output_dir", default=None, type=str, required=True,
                         help="The output directory where the model predictions and checkpoints will be written.")   
     
@@ -212,6 +223,8 @@ def main():
     
     parser.add_argument('--enable_fixed_block', action='store_true',
                         help="Split code into blocks by fixed line")
+    parser.add_argument('--retrieval_method', default="bm25", type=str,
+                        help="The method used to retrieve relevant code")
     parser.add_argument('--relevant_code_num', default=3, type=int,
                         help="Total number of relevant code blocks to use")
     parser.add_argument('--max_input_length', default=1024, type=int,
@@ -223,6 +236,9 @@ def main():
     
     # print arguments
     args = parser.parse_args()
+    
+    if args.retrieval_method != "bm25":
+        assert args.retriever_name_or_path is not None
     
     # make dir if output_dir not exist
     if os.path.exists(args.output_dir) is False:
@@ -249,10 +265,9 @@ def main():
     set_seed(args.seed)
 
     # build model
-    generator, tokenizer = build_model(args)
+    generator, retriever = build_model(args)
     
     logger.info("Training/evaluation parameters %s", args)
-    generator.to(args.device)  
     
     all_eval_examples = {
         # "github": load_dataset("github"),
@@ -262,7 +277,7 @@ def main():
         "repoeval_line": load_dataset("repoeval_line")
     }
     
-    test(all_eval_examples, generator, tokenizer, args, epoch=0)
+    test(all_eval_examples, generator, retriever, args, epoch=0)
                 
 if __name__ == '__main__':
     main()  

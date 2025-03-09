@@ -17,7 +17,7 @@ python run.py \
 python run.py \
     --generator_name_or_path /data/hanzhenlu/LLaMA-Factory/saves/opc-sft-v1 \
     --retriever_name_or_path /data/hanzhenlu/model/microsoft/unixcoder-base \
-    --output_dir outputs/unixcoder \
+    --output_dir outputs/unixcoder-debug \
     --train_filename github_projects \
     --do_train \
     --do_valid \
@@ -26,10 +26,28 @@ python run.py \
     --eval_batch_size 16 \
     --GPU_ids 2 \
     --max_input_length 2048 \
-    --max_crossfile_length 1536 
-```
+    --max_crossfile_length 1536 \
+    --debug
 
-* 顺序对性能有影响吗？如果有，是怎么样的影响？
-    * 使用bm25按相似度从小到大、从大到小以及完全随机都测试一遍就能知道结果了
-* 如果一个样例没有相应的related file该如何处理
-    * 
+python run.py \
+    --generator_name_or_path /data/hanzhenlu/LLaMA-Factory/saves/opc-sft-v1 \
+    --retriever_name_or_path /data/hanzhenlu/model/CodeRankEmbed \
+    --output_dir outputs/CodeRankEmbed \
+    --train_filename github_projects \
+    --do_test \
+    --eval_batch_size 16 \
+    --GPU_ids 6 \
+    --max_input_length 2048 \
+    --max_crossfile_length 1536
+
+# 用于测试deepseek
+python deepseek.py \
+    --generator_name_or_path /nasdata/Model/deepseek-coder-1.3b-base \
+    --retriever_name_or_path /data/hanzhenlu/model/microsoft/unixcoder-base \
+    --retrieval_method unixcoder-base \
+    --output_dir outputs/deepseek-unixcoder \
+    --eval_batch_size 16 \
+    --GPU_ids 5 \
+    --max_input_length 2048 \
+    --max_crossfile_length 1536
+```
