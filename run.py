@@ -243,7 +243,7 @@ def main():
                 loss = None
                 for feature in batch:
                     feature:InputFeatures
-                    scores, documents_map = retriever.retrieve(feature.query, feature.document, 
+                    scores, documents_permutation = retriever.retrieve(feature.query, feature.document, 
                                                            args.sampling_num, args.relevant_code_num)
                     decoder_features = [
                         InputFeatures(
@@ -252,17 +252,13 @@ def main():
                             feature.middle_ids,
                             document=documents
                         )
-                        for documents in documents_map.values()
+                        for documents in documents_permutation
                     ]
                     
                     with torch.no_grad():
                         feature_loss = generator.generate(decoder_features, True)
                     
-                    permutation_indices = torch.tensor(list(documents_map.keys()), device=device)
-                    permutation_scores = scores[permutation_indices]
-                    assert torch.all(permutation_scores != 0)
-                    
-                    current_loss = torch.dot(permutation_scores, feature_loss)
+                    current_loss = torch.dot(scores, feature_loss)
                     loss = current_loss if loss is None else loss + current_loss
                 
                 if args.gradient_accumulation_steps > 1:

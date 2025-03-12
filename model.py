@@ -69,14 +69,12 @@ class Retriever:
             doc_ids = permutations[permutation_id]
             return [documents[i] for i in doc_ids]
         
-        samples = {}
+        samples = [[documents[id] for id in doc_ids] for doc_ids in permutations]
         sum = torch.zeros_like(permutation_scores)
         for _ in range(k):
             soft_samples = torch.nn.functional.gumbel_softmax(permutation_scores, self.tau, hard=True, dim=-1)
             permutation_id = torch.argmax(soft_samples, dim=-1).cpu()
             doc_ids = permutations[permutation_id]
-            if permutation_id not in samples:
-                samples[permutation_id.item()] = [documents[i] for i in doc_ids]
             sum += soft_samples
         
         return sum, samples
