@@ -45,7 +45,7 @@ def test(benchmark:Benchmarks, names:List[str], generator:Generator, retriever:R
         with torch.no_grad():
             for feature in features:
                 documents = retriever.retrieve(feature.query, feature.document, 
-                                                    args.sampling_num, args.relevant_code_num, False)
+                                               args.relevant_code_num, False)
                 decoder_features.append(
                     InputFeatures(
                         feature.prefix_ids,
@@ -180,29 +180,48 @@ def main():
     ]
     
     generator_name = args.generator_name_or_path.split('/')[-1]
-    benchmark_ckp = f"intermediate/{args.sampling_num}-{generator_name}.pkl"
+    benchmark_ckp = f"intermediate/{args.relevant_code_num}-{generator_name}-{args.enable_fixed_block}-test.pkl"
+    if "/" in args.train_filename:
+        train_file_name = args.train_filename.split('/')[-1]
+        train_file_name = train_file_name.split('.')[0]
+    else:
+        train_file_name = args.train_filename
+    trainfeature_ckp = f"intermediate/{args.relevant_code_num}-{generator_name}-{args.enable_fixed_block}-{args.debug}-{train_file_name}-train.pkl"
+    
     benchmark = Benchmarks(None, generator.tokenizer, args)
     if os.path.exists(benchmark_ckp):
         with open(benchmark_ckp, "rb") as f:
+            logger.info(f"loading from {benchmark_ckp}")
             benchmark.test_features = pickle.load(f)
             benchmark.test_features.pop("github_projects", None)
     
     logger.info("Training/evaluation parameters %s", args)
     
     if args.do_train:
-        data = load_dataset(args.train_filename)
-        if args.debug:
-            train_data = data[:int(len(data)*0.009)]
-            valid_data = data[int(len(data)*0.999):]
+        if os.path.exists(trainfeature_ckp):
+            with open(trainfeature_ckp, "rb") as f:
+                logger.info(f"loading from {trainfeature_ckp}")
+                train_features, valid_data = pickle.load(f)
+            benchmark.test_datasets["github_projects"] = valid_data
         else:
-            train_data = data[:int(len(data)*0.9)]
-            valid_data = data[int(len(data)*0.9):]
-        benchmark.test_datasets["github_projects"] = valid_data
-        train_features = []
-        for example in tqdm(train_data, desc="convert examples to features"):
-            train_feature = convert_example_to_feature(example.prefix, example.suffix, example.middle, \
-                example.relevant_code, generator.tokenizer, args)
-            train_features.append(train_feature)
+            data = load_dataset(args.train_filename)
+            if args.debug:
+                train_data = data[:int(len(data)*0.02)]
+                valid_data = data[int(len(data)*0.999):]
+            else:
+                train_data = data[:int(len(data)*0.9)]
+                valid_data = data[int(len(data)*0.9):]
+            benchmark.test_datasets["github_projects"] = valid_data
+            train_features = []
+            for example in tqdm(train_data, desc="convert examples to features"):
+                train_feature = convert_example_to_feature(example.prefix, example.suffix, example.middle, \
+                    example.relevant_code, generator.tokenizer, args)
+                if len(train_feature.document) <= 1:
+                    continue
+                train_features.append(train_feature)
+            
+            with open(trainfeature_ckp, "wb") as f:
+                pickle.dump((train_features, valid_data), f)
         train_dataset = MyDataset(train_features)
         train_sampler = RandomSampler(train_dataset)
         train_dataloader = DataLoader(train_dataset, sampler=train_sampler, 
@@ -229,11 +248,11 @@ def main():
         
         losses = []
         
-        if args.do_valid:
-            test(benchmark, ["github_projects"] + testsets_name, generator, retriever, args, 0)
-            if not os.path.exists(benchmark_ckp):
-                with open(benchmark_ckp, "wb") as f:
-                    pickle.dump(benchmark.test_features, f)
+        # if args.do_valid and not args.debug:
+        #     test(benchmark, ["github_projects"] + testsets_name, generator, retriever, args, 0)
+        #     if not os.path.exists(benchmark_ckp):
+        #         with open(benchmark_ckp, "wb") as f:
+        #             pickle.dump(benchmark.test_features, f)
         
         for epoch in range(1, args.num_train_epochs+1):
             for batch in train_dataloader:
@@ -244,7 +263,7 @@ def main():
                 for feature in batch:
                     feature:InputFeatures
                     scores, documents_permutation = retriever.retrieve(feature.query, feature.document, 
-                                                           args.sampling_num, args.relevant_code_num)
+                                                                       args.relevant_code_num)
                     decoder_features = [
                         InputFeatures(
                             feature.prefix_ids,
@@ -271,17 +290,17 @@ def main():
                     optimizer.zero_grad()
                     scheduler.step()
                     if len(losses) // args.gradient_accumulation_steps % 100 == 0:
-                        # 调整退火温度
-                        # TODO: 将退火温度也设置成一个超参数
-                        retriever.tau = min(0.01, retriever.tau * 0.95)
                         logger.info("epoch {} step {} loss {}".format(epoch,
                                                      len(losses)//args.gradient_accumulation_steps,
                                                      round(np.mean(losses[-100*args.gradient_accumulation_steps:]),4)))
         
             if args.do_valid:
                 test(benchmark, ["github_projects"] + testsets_name, generator, retriever, args, epoch)
+                if not os.path.exists(benchmark_ckp):
+                    with open(benchmark_ckp, "wb") as f:
+                        pickle.dump(benchmark.test_features, f)
     
-    if args.do_test:
+    if args.do_test and not args.do_valid:
         test(benchmark, testsets_name, generator, retriever, args, 0 if not args.do_train else epoch)
         if not os.path.exists(benchmark_ckp):
             with open(benchmark_ckp, "wb") as f:

@@ -20,7 +20,6 @@ class Retriever:
             self.model = AutoModel.from_pretrained(model_name_or_path, add_pooling_layer=False, trust_remote_code=True)
         else:
             self.model = AutoModel.from_pretrained(model_name_or_path, trust_remote_code=True)
-        self.tau = 1.0
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     def embedding(self, input_str:Union[str, List[str]], is_query:bool) -> torch.Tensor:
@@ -33,21 +32,20 @@ class Retriever:
         embedding = torch.nn.functional.normalize(embedding, p=2, dim=1)
         return embedding
     
-    def retrieve(self, query_str:str, documents:List[CodeBlock], k:int, n:int, is_training:bool=True) \
+    def retrieve(self, query_str:str, documents:List[CodeBlock], n:int, is_training:bool=True) \
         -> Union[Tuple[torch.Tensor, Dict], List[str]]:
         r'''
         返回候选文档每种排列被采样到的次数，以及被采样到的排列下标与检索内容之间的映射
         Params:
             query_str:用于检索的字符串
             document_str:被检索的文档合集
-            k:采样次数
             n:检索返回的最大文档数量
         '''
+        if len(documents) == 0:
+            return []
+        
         # 提供的文档数可能小于需要的文档数
         n = min(n, len(documents))
-        # 如果只有一个候选项的话采样一次就够了
-        if len(documents) == 1:
-            k = 1
         
         query_embedding = self.embedding(query_str, True)
         document_embedding = self.embedding([doc.code_content for doc in documents], False)
@@ -70,14 +68,10 @@ class Retriever:
             return [documents[i] for i in doc_ids]
         
         samples = [[documents[id] for id in doc_ids] for doc_ids in permutations]
-        sum = torch.zeros_like(permutation_scores)
-        for _ in range(k):
-            soft_samples = torch.nn.functional.gumbel_softmax(permutation_scores, self.tau, hard=True, dim=-1)
-            permutation_id = torch.argmax(soft_samples, dim=-1).cpu()
-            doc_ids = permutations[permutation_id]
-            sum += soft_samples
+        softmax = torch.nn.Softmax(dim=-1)
+        scores = softmax(permutation_scores)
         
-        return sum, samples
+        return scores, samples
     
     def eval(self):
         self.model.eval()
@@ -140,7 +134,8 @@ class Generator:
         self.special_token_ids = {
             "prefix_id": self.tokenizer.convert_tokens_to_ids("<PREFIX>"),
             "suffix_id": self.tokenizer.convert_tokens_to_ids("<SUFFIX>"),
-            "middle_id": self.tokenizer.convert_tokens_to_ids("<MIDDLE>")
+            "middle_id": self.tokenizer.convert_tokens_to_ids("<MIDDLE>"),
+            "eos_id": self.tokenizer.convert_tokens_to_ids("<EOS>")
         }
         self.args = args
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -178,10 +173,10 @@ class Generator:
             if is_training:    
                 input_ids = [self.special_token_ids["suffix_id"]] + suffix_ids + [self.special_token_ids["prefix_id"]] \
                     + cross_file_context["input_ids"] + prefix_ids + [self.special_token_ids["middle_id"]] + \
-                        feature.middle_ids + [self.tokenizer.eos_token_id]
+                        feature.middle_ids + [self.special_token_ids["eos_id"]]
                 attention_mask = [1] * len(input_ids)
                 labels = [-100] * (len(input_ids) - len(feature.middle_ids) - 1) \
-                    + feature.middle_ids + [self.tokenizer.eos_token_id]
+                    + feature.middle_ids + [self.special_token_ids["eos_id"]]
                 padding_length = self.args.max_input_length - len(input_ids)
                 input_ids += [self.tokenizer.pad_token_id] * padding_length
                 attention_mask += [0] * padding_length
@@ -210,14 +205,28 @@ class Generator:
                                 labels=label_tensor)
             
             batch_logits = outputs.logits
-            loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
-
+            loss_fct = torch.nn.CrossEntropyLoss(reduction='none', ignore_index=-100)
+            
+            shift_logits = batch_logits[..., :-1, :].contiguous()
+            shift_labels = label_tensor[..., 1:].contiguous()
+            
             per_position_loss = loss_fct(
-                batch_logits.view(-1, batch_logits.size(-1)),
-                label_tensor.view(-1)
-            ).view(batch_logits.size(0), batch_logits.size(1))
+                shift_logits.view(-1, batch_logits.size(-1)),
+                shift_labels.view(-1)
+            ).view(batch_logits.size(0), -1)
 
-            per_sample_loss = per_position_loss.mean(dim=1)
+            # 创建掩码，标记有效标签位置（不等于-100）
+            mask = (shift_labels != -100)
+            
+            # 计算每个样本的总损失（忽略的位置损失已为0）
+            per_sample_loss_sum = per_position_loss.sum(dim=1)
+            
+            # 计算每个样本的有效标签数量，并将0替换为1避免除以0
+            valid_counts = mask.sum(dim=1).float()
+            valid_counts[valid_counts == 0] = 1.0
+            
+            # 计算每个样本的平均损失
+            per_sample_loss = per_sample_loss_sum / valid_counts
             return per_sample_loss
             
         else:

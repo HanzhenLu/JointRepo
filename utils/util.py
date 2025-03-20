@@ -86,7 +86,9 @@ def load_dataset(datasetname:str) -> List[Example]:
     :param datasetname: The name of the dataset to load.
     :return: The loaded dataset.
     """
-    if datasetname == "cceval_python":
+    if os.path.exists(datasetname):
+        data_frame = pd.read_json(datasetname)
+    elif datasetname == "cceval_python":
         data_frame = pd.read_parquet("data/cceval/python/test.parquet")
     elif datasetname == "repoeval_line":
         data_frame_parts = []
@@ -123,20 +125,23 @@ def convert_example_to_feature(prefix:str, suffix:str, middle:str, related_files
     
     candidate_str = [x.code_content for x in code_blocks]
     prefix_line = prefix.split("\n")
-    # TODO: set the query_line as a hyperparameter
-    if len(prefix_line) >= 15:
-        query_str = "\n".join(prefix_line[-15:])
-    else:
-        query_str = "\n".join(prefix_line)
-        suffix_line = suffix.split("\n")
-        query_str += "\n" + "\n".join(suffix_line[:15-len(prefix_line)])
+    # 处理前缀部分：最多取8行
+    prefix_part = prefix_line[-8:] if len(prefix_line) >= 8 else prefix_line
+    remaining = 15 - len(prefix_part)  # 计算需要从后缀补充的行数
+
+    # 处理后缀部分：过滤空行并取剩余需要的行数
+    suffix_line_clean = [line for line in suffix.split('\n') if line.strip()]
+    suffix_part = suffix_line_clean[:remaining]
+
+    # 合并结果
+    query_str = "\n".join(prefix_part + suffix_part)
     
     candidate_num = args.relevant_code_num * 5
     result = bm25_retrieve(query_str, candidate_str, tokenizer, k=candidate_num)
     
     related_codes = [code_blocks[x[1]] for x in result]
-    for i in range(args.relevant_code_num):
-        related_codes.append(CodeBlock("Unknown", f"# Don't need crossfile {i}"))
+    # for i in range(args.relevant_code_num):
+    #     related_codes.append(CodeBlock("Unknown", f"# Don't need crossfile {i}"))
     
     prefix_tokenized_result = tokenizer(prefix, add_special_tokens=False)
     suffix_tokenized_result = tokenizer(suffix, add_special_tokens=False)
@@ -160,7 +165,7 @@ def split_into_smaller_blocks(code_block:CodeBlock, enable_fixed_block:bool) -> 
     # 每15行划分一个block
     if enable_fixed_block:
         lines = [line for line in code_block.code_content.split('\n') if line.strip() != '']
-        for i in range(0, min(len(lines),5000), 15):
+        for i in range(0, min(len(lines),5000), 7):
             start_line_offset = i
             end_line_offset = min(i + 15, len(lines))
             block_content = '\n'.join(lines[start_line_offset:end_line_offset])
