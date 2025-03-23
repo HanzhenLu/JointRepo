@@ -134,8 +134,6 @@ def main():
                         help="Split code into blocks by fixed line")
     parser.add_argument('--relevant_code_num', default=3, type=int,
                         help="Total number of relevant code blocks to use")
-    parser.add_argument('--sampling_num', default=10, type=int,
-                        help="Total number of sampling")
     parser.add_argument('--max_input_length', default=1024, type=int,
                         help="Max token num for input feature")
     parser.add_argument('--max_crossfile_length', default=512, type=int,
@@ -181,13 +179,6 @@ def main():
     
     generator_name = args.generator_name_or_path.split('/')[-1]
     benchmark_ckp = f"intermediate/{args.relevant_code_num}-{generator_name}-{args.enable_fixed_block}-test.pkl"
-    if "/" in args.train_filename:
-        train_file_name = args.train_filename.split('/')[-1]
-        train_file_name = train_file_name.split('.')[0]
-    else:
-        train_file_name = args.train_filename
-    trainfeature_ckp = f"intermediate/{args.relevant_code_num}-{generator_name}-{args.enable_fixed_block}-{args.debug}-{train_file_name}-train.pkl"
-    
     benchmark = Benchmarks(None, generator.tokenizer, args)
     if os.path.exists(benchmark_ckp):
         with open(benchmark_ckp, "rb") as f:
@@ -198,6 +189,13 @@ def main():
     logger.info("Training/evaluation parameters %s", args)
     
     if args.do_train:
+        if "/" in args.train_filename:
+            train_file_name = args.train_filename.split('/')[-1]
+            train_file_name = train_file_name.split('.')[0]
+        else:
+            train_file_name = args.train_filename
+        trainfeature_ckp = f"intermediate/{args.relevant_code_num}-{generator_name}-{args.enable_fixed_block}-{args.debug}-{train_file_name}-train.pkl"
+        
         if os.path.exists(trainfeature_ckp):
             with open(trainfeature_ckp, "rb") as f:
                 logger.info(f"loading from {trainfeature_ckp}")

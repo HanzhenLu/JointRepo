@@ -131,12 +131,22 @@ class Generator:
         self.model = AutoModelForCausalLM.from_pretrained(model_name_or_path)
         # 特殊标记ID映射
         # TODO: 这需要根据模型进行改动
-        self.special_token_ids = {
-            "prefix_id": self.tokenizer.convert_tokens_to_ids("<PREFIX>"),
-            "suffix_id": self.tokenizer.convert_tokens_to_ids("<SUFFIX>"),
-            "middle_id": self.tokenizer.convert_tokens_to_ids("<MIDDLE>"),
-            "eos_id": self.tokenizer.convert_tokens_to_ids("<EOS>")
-        }
+        if "opc" in model_name_or_path or "llama" in model_name_or_path:
+            self.special_token_ids = {
+                "prefix_id": self.tokenizer.convert_tokens_to_ids("<PREFIX>"),
+                "suffix_id": self.tokenizer.convert_tokens_to_ids("<SUFFIX>"),
+                "middle_id": self.tokenizer.convert_tokens_to_ids("<MIDDLE>"),
+                "eos_id": self.tokenizer.convert_tokens_to_ids("<EOS>")
+            }
+        elif "deepseek" in model_name_or_path:
+            self.special_token_ids = {
+                "prefix_id": self.tokenizer.convert_tokens_to_ids("<｜fim▁begin｜>"),
+                "suffix_id": self.tokenizer.convert_tokens_to_ids("<｜fim▁end｜>"),
+                "middle_id": self.tokenizer.convert_tokens_to_ids("<｜fim▁hole｜>"),
+                "eos_id": self.tokenizer.eos_token_id
+            }
+        else:
+            raise RuntimeError("Unknown generator")
         self.args = args
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -150,9 +160,9 @@ class Generator:
             
             # 计算分配长度
             if is_training:
-                max_allocated_length = self.args.max_input_length - len(cross_file_context["input_ids"]) - len(feature.middle_ids) - 4
+                max_allocated_length = self.args.max_input_length - len(cross_file_context["input_ids"]) - len(feature.middle_ids) - 5
             else:
-                max_allocated_length = self.args.max_input_length - len(cross_file_context["input_ids"]) - 3
+                max_allocated_length = self.args.max_input_length - len(cross_file_context["input_ids"]) - 4
             prefix_length = max_allocated_length // 2
             suffix_length = max_allocated_length - prefix_length
             if len(feature.prefix_ids) < prefix_length and len(feature.suffix_ids) < suffix_length:
@@ -170,13 +180,20 @@ class Generator:
                 prefix_ids = feature.prefix_ids[-prefix_length:]
                 suffix_ids = feature.suffix_ids[:suffix_length]
             
-            if is_training:    
-                input_ids = [self.special_token_ids["suffix_id"]] + suffix_ids + [self.special_token_ids["prefix_id"]] \
-                    + cross_file_context["input_ids"] + prefix_ids + [self.special_token_ids["middle_id"]] + \
-                        feature.middle_ids + [self.special_token_ids["eos_id"]]
-                attention_mask = [1] * len(input_ids)
+            if is_training:
+                if "opc" in self.args.generator_name_or_path or "llama" in self.args.generator_name_or_path:
+                    input_ids = [self.special_token_ids["suffix_id"]] + suffix_ids + [self.special_token_ids["prefix_id"]] \
+                        + cross_file_context["input_ids"] + prefix_ids + [self.special_token_ids["middle_id"]] + \
+                            feature.middle_ids + [self.special_token_ids["eos_id"]]
+                    
+                elif "deepseek" in self.args.generator_name_or_path:
+                    input_ids = [32013] + [self.special_token_ids["prefix_id"]] + cross_file_context["input_ids"] \
+                        + prefix_ids + [self.special_token_ids["middle_id"]] + suffix_ids + [self.special_token_ids["suffix_id"]] \
+                        + feature.middle_ids + [self.special_token_ids["eos_id"]]
+                
                 labels = [-100] * (len(input_ids) - len(feature.middle_ids) - 1) \
                     + feature.middle_ids + [self.special_token_ids["eos_id"]]
+                attention_mask = [1] * len(input_ids)
                 padding_length = self.args.max_input_length - len(input_ids)
                 input_ids += [self.tokenizer.pad_token_id] * padding_length
                 attention_mask += [0] * padding_length
@@ -186,8 +203,12 @@ class Generator:
                 batch_attention_mask.append(attention_mask)
                 batch_labels.append(labels)
             else:
-                input_ids = [self.special_token_ids["suffix_id"]] + suffix_ids + [self.special_token_ids["prefix_id"]] \
-                    + cross_file_context["input_ids"] + prefix_ids + [self.special_token_ids["middle_id"]]
+                if "opc" in self.args.generator_name_or_path or "llama" in self.args.generator_name_or_path:
+                    input_ids = [self.special_token_ids["suffix_id"]] + suffix_ids + [self.special_token_ids["prefix_id"]] \
+                        + cross_file_context["input_ids"] + prefix_ids + [self.special_token_ids["middle_id"]]
+                elif "deepseek" in self.args.generator_name_or_path:
+                    input_ids = [32013] + [self.special_token_ids["prefix_id"]] + cross_file_context["input_ids"] \
+                        + prefix_ids + [self.special_token_ids["middle_id"]] + suffix_ids + [self.special_token_ids["suffix_id"]]
                 attention_mask = [1] * len(input_ids)
                 padding_length = self.args.max_input_length - len(input_ids)
                 input_ids = [self.tokenizer.pad_token_id] * padding_length + input_ids
@@ -195,7 +216,7 @@ class Generator:
                 assert len(input_ids) == len(attention_mask)
                 batch_input_ids.append(input_ids)
                 batch_attention_mask.append(attention_mask)
-        
+            
         input_tensor = torch.tensor(batch_input_ids, dtype=torch.long).to(self.device)
         attention_tensor = torch.tensor(batch_attention_mask, dtype=torch.bool).to(self.device)
         if is_training:
