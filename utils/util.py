@@ -3,6 +3,7 @@ import pandas as pd
 import tokenize
 import io
 import re
+import os
 from fastbm25 import fastbm25
 from typing import Tuple, List, Dict
 from torch import FloatTensor, LongTensor
@@ -45,13 +46,15 @@ def load_train_and_valid_dataset(dataset_path:str) -> Tuple[List[List[Tuple[str,
 
     return training_datasets, validation_datasets
 
-def load_dataset(datasetname:str) -> List[Example]:
+def load_dataset(datasetname:str, tokenizer, args) -> List[Example]:
     """
     Loads a dataset.
     :param datasetname: The name of the dataset to load.
     :return: The loaded dataset.
     """
-    if datasetname == "cceval_python":
+    if os.path.exists(datasetname):
+        data_frame = pd.read_json(datasetname)
+    elif datasetname == "cceval_python":
         data_frame = pd.read_parquet("data/cceval/python/test.parquet")
     elif datasetname == "repoeval_line":
         data_frame_parts = []
@@ -66,15 +69,33 @@ def load_dataset(datasetname:str) -> List[Example]:
         data_frame = pd.read_parquet("data/ours/python/test_suffix.parquet")
     else:
         raise Exception("Unsupport dataset name")
-
+    
     datasets = []
     for item in data_frame[["task_id", "path", "left_context", "right_context", "crossfile_context", "groundtruth"]].values:
         cross_files = item[4] if len(item[4]) > 0 else [{'path': "", "text": "Don't need cross file context for completion"}]
         cross_files = [CodeBlock(x["path"], x["text"]) for x in cross_files]
+        code_blocks:List[CodeBlock] = []
+        for file in cross_files:
+            code_blocks.extend(split_into_smaller_blocks(file, args.enable_fixed_block))
+        
+        prefix_line = item[2].split("\n")
+        # 处理前缀部分：最多取8行
+        prefix_part = prefix_line[-8:] if len(prefix_line) >= 8 else prefix_line
+        remaining = 15 - len(prefix_part)  # 计算需要从后缀补充的行数
+
+        # 处理后缀部分：过滤空行并取剩余需要的行数
+        suffix_line_clean = [line for line in item[3].split('\n') if line.strip()]
+        suffix_part = suffix_line_clean[:remaining]
+
+        # 合并结果
+        query_str = "\n".join(prefix_part + suffix_part)
+        result = bm25_retrieve(query_str, [code_block.code_content for code_block in code_blocks], tokenizer, args.relevant_code_num)
+        retrieved_codeblocks = [code_blocks[x[1]] for x in result]
+        
         if datasetname == "repoeval_line":
-            datasets.append(Example(item[0], item[2]+"\n", item[3], item[5], cross_files))
+            datasets.append(Example(item[0], item[2]+"\n", item[3], item[5], retrieved_codeblocks))
         else:
-            datasets.append(Example(item[0], item[2], item[3], item[5], cross_files))
+            datasets.append(Example(item[0], item[2], item[3], item[5], retrieved_codeblocks))
     
     return datasets
 
@@ -126,7 +147,7 @@ def split_into_smaller_blocks(code_block:CodeBlock, enable_fixed_block:bool) -> 
     # 每15行划分一个block
     if enable_fixed_block:
         lines = [line for line in code_block.code_content.split('\n') if line.strip() != '']
-        for i in range(0, min(len(lines),5000), 15):
+        for i in range(0, min(len(lines),5000), 8):
             start_line_offset = i
             end_line_offset = min(i + 15, len(lines))
             block_content = '\n'.join(lines[start_line_offset:end_line_offset])
@@ -238,7 +259,7 @@ def get_NL_list(tokenizer:AutoTokenizer) -> List[int]:
     return NL_list
 
 def bm25_retrieve(query_str:str, candidate_str:List[str], tokenizer:PreTrainedTokenizer, k:int):
-    if k == 0:
+    if k == 0 or len(candidate_str) == 0:
         return []
     # TODO: 将检索使用的token数量设置为一个参数
     tokenized_corpus = [tokenizer.tokenize(doc)[:200] for doc in candidate_str]

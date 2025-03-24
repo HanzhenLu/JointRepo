@@ -6,6 +6,7 @@ import logging
 import argparse
 import json
 import numpy as np
+import pickle
 from tqdm import tqdm
 from typing import List, Tuple, Dict
 from torch.utils.data import DataLoader, Dataset, RandomSampler
@@ -40,29 +41,14 @@ class InputFeatures(object):
         self.attention_mask = attention_mask
         self.target_ids = target_ids
         
-def convert_example_to_feature(prefix:str, suffix:str, middle:str, related_files:List[CodeBlock], tokenizer:PreTrainedTokenizer, args) -> InputFeatures:
+def convert_example_to_feature(prefix:str, suffix:str, middle:str, related_codes:List[CodeBlock], tokenizer:PreTrainedTokenizer, args) -> InputFeatures:
     prefix_id = tokenizer.convert_tokens_to_ids("<PREFIX>")
     suffix_id = tokenizer.convert_tokens_to_ids("<SUFFIX>")
     middle_id = tokenizer.convert_tokens_to_ids("<MIDDLE>")
+    eos_id = tokenizer.convert_tokens_to_ids("<EOS>")
     
-    code_blocks:List[CodeBlock] = []
-    for file in related_files:
-        code_blocks.extend(split_into_smaller_blocks(file, args.enable_fixed_block))
-    
-    candidate_str = [x.code_content for x in code_blocks]
-    prefix_line = prefix.split("\n")
-    # TODO: set the query_line as a hyperparameter
-    if len(prefix_line) >= 15:
-        query_str = "\n".join(prefix_line[-15:])
-    else:
-        query_str = "\n".join(prefix_line)
-        suffix_line = suffix.split("\n")
-        query_str += "\n" + "\n".join(suffix_line[:15-len(prefix_line)])
-    result = bm25_retrieve(query_str, candidate_str, tokenizer, k=args.relevant_code_num)
-    
-    related_codes = [code_blocks[x[1]] for x in result]
     # TODO: set the cross_file_budget as a hyperparameter
-    repo_content = cross_file_contexts(related_codes, tokenizer, int(args.max_input_length * 0.25))
+    repo_content = cross_file_contexts(related_codes, tokenizer, int(args.max_input_length * 0.75))
     
     prefix_tokenized_result = tokenizer(prefix, add_special_tokens=False)
     suffix_tokenized_result = tokenizer(suffix, add_special_tokens=False)
@@ -87,12 +73,12 @@ def convert_example_to_feature(prefix:str, suffix:str, middle:str, related_files
         suffix_ids = suffix_tokenized_result["input_ids"][:suffix_length]
     middle_ids = middle_tokenized_result["input_ids"]
 
-    input_ids = [suffix_id] + suffix_ids + [prefix_id] + repo_content["input_ids"] + prefix_ids + [middle_id] + middle_ids + [tokenizer.eos_token_id]
+    input_ids = [suffix_id] + suffix_ids + [prefix_id] + repo_content["input_ids"] + prefix_ids + [middle_id] + middle_ids + [eos_id]
     attention_mask = [1] * len(input_ids)
 
     feature = InputFeatures(input_ids + [tokenizer.pad_token_id] * (args.max_input_length - len(input_ids)), 
                             attention_mask + [0] * (args.max_input_length - len(input_ids)), 
-                            [-100] * (len(input_ids) - len(middle_ids) - 1) + middle_ids + [tokenizer.eos_token_id] + [-100] * (args.max_input_length - len(input_ids))
+                            [-100] * (len(input_ids) - len(middle_ids) - 1) + middle_ids + [eos_id] + [-100] * (args.max_input_length - len(input_ids))
     )
     if len(feature.input_ids) != len(feature.target_ids) or len(feature.input_ids) != args.max_input_length:
         print(len(repo_content["input_ids"]))
@@ -229,7 +215,15 @@ def main():
 
     # build model
     generator, tokenizer = build_model(args)
-    all_eval_examples = None
+    all_eval_examples = {
+        "ours_suffix": load_dataset("ours_suffix", tokenizer, args),
+        "ours": load_dataset("ours", tokenizer, args),
+        "cceval_python": load_dataset("cceval_python", tokenizer, args),
+        "repoeval_line": load_dataset("repoeval_line", tokenizer, args)
+    }
+    
+    with open(f"{args.output_dir}/retrieval.pkl", 'wb') as f:
+        pickle.dump(all_eval_examples, f)
     
     logger.info("Training/evaluation parameters %s", args)
     generator.to(args.device)  
@@ -237,7 +231,7 @@ def main():
         generator = torch.nn.DataParallel(generator)
     
     if args.do_train:
-        data = load_dataset(args.train_filename)
+        data = load_dataset(args.train_filename, tokenizer, args)
         train_data = data[:int(len(data)*0.9)]
         valid_data = data[int(len(data)*0.9):]
         train_features = []
@@ -269,8 +263,8 @@ def main():
         
         losses = []
         
-        if args.do_valid:
-            test({"github_projects":valid_data}, generator, tokenizer, args, 0)
+        # if args.do_valid:
+        #     test({**all_eval_examples, "github_projects":valid_data}, generator, tokenizer, args, 0)
         
         for epoch in range(1, args.num_train_epochs+1):
             for batch in train_dataloader:
@@ -305,21 +299,9 @@ def main():
                                                      round(np.mean(losses[-100*args.gradient_accumulation_steps:]),4)))
         
             if args.do_valid:
-                test({"github_projects":valid_data}, generator, tokenizer, args, epoch)
+                test({**all_eval_examples, "github_projects":valid_data}, generator, tokenizer, args, epoch)
     
-    if args.do_test:
-        
-        if all_eval_examples is None:
-            # first time to do valid
-            
-            all_eval_examples = {
-                "ours_suffix": load_dataset("ours_suffix"),
-                "ours": load_dataset("ours"),
-                "cceval_python": load_dataset("cceval_python"),
-                "repoeval_line": load_dataset("repoeval_line")
-            }
-        
-        
+    if args.do_test and not args.do_valid:
         test(all_eval_examples, generator, tokenizer, args, 0 if not args.do_train else epoch)
                 
 if __name__ == '__main__':

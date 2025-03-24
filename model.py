@@ -70,25 +70,10 @@ class CustomDataset(Dataset):
         '''
         prefix = example.prefix
         suffix = example.suffix
-        
-        code_blocks:List[CodeBlock] = []
-        for file in example.relevant_code:
-            code_blocks.extend(split_into_smaller_blocks(file, self.args.enable_fixed_block))
-            
-        prefix_line = prefix.split("\n")
-        # TODO: set the query_line as a hyperparameter
-        if len(prefix_line) >= 15:
-            query_str = "\n".join(prefix_line[-15:])
-        else:
-            query_str = "\n".join(prefix_line)
-            suffix_line = suffix.split("\n")
-            query_str += "\n" + "\n".join(suffix_line[:15-len(prefix_line)])
-        result = bm25_retrieve(query_str, [code_block.code_content for code_block in code_blocks], self.tokenizer, self.args.relevant_code_num)
-        retrieved_codeblocks = [code_blocks[x[1]] for x in result]
             
         # TODO: set the cross_file_budget as a hyperparameter
-        cross_file_budget = int(0.25 * self.args.max_input_length)
-        repo_content = cross_file_contexts(retrieved_codeblocks, self.tokenizer, cross_file_budget)
+        cross_file_budget = int(0.75 * self.args.max_input_length)
+        repo_content = cross_file_contexts(example.relevant_code, self.tokenizer, cross_file_budget)
         
         prefix_tokenized_result = self.tokenizer(prefix, add_special_tokens=False)
         suffix_tokenized_result = self.tokenizer(suffix, add_special_tokens=False)
