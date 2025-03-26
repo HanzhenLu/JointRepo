@@ -8,11 +8,14 @@ import json
 import numpy as np
 import pickle
 from tqdm import tqdm
-from typing import List, Tuple, Dict
+from typing import List, Dict
 from torch.utils.data import DataLoader, Dataset, RandomSampler
-from transformers import (AdamW, get_linear_schedule_with_warmup, PreTrainedTokenizer, PreTrainedModel)
-
-from utils.util import (load_dataset, CodeBlock, split_into_smaller_blocks, Example, bm25_retrieve, cross_file_contexts)
+from torch.optim import AdamW
+from transformers import (get_linear_schedule_with_warmup, 
+                          PreTrainedTokenizer, PreTrainedModel)
+from utils.util import (load_dataset, cross_file_contexts, 
+                        CodeBlock, Example, InputFeatures)
+from pathlib import Path
 from model import (build_model, generate)
 from eval import compute_metric_stmt
 
@@ -28,18 +31,6 @@ def set_seed(seed=42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
-
-
-class InputFeatures(object):
-    """A single training/test features for a example."""
-    def __init__(self,
-                 input_ids:List[int],
-                 attention_mask:List[int],
-                 target_ids:List[int]
-    ):
-        self.input_ids = input_ids
-        self.attention_mask = attention_mask
-        self.target_ids = target_ids
         
 def convert_example_to_feature(prefix:str, suffix:str, middle:str, related_codes:List[CodeBlock], tokenizer:PreTrainedTokenizer, args) -> InputFeatures:
     prefix_id = tokenizer.convert_tokens_to_ids("<PREFIX>")
@@ -181,7 +172,7 @@ def main():
                         help="Split code into blocks by fixed line")
     parser.add_argument('--relevant_code_num', default=3, type=int,
                         help="Total number of relevant code blocks to use")
-    parser.add_argument('--max_input_length', default=1024, type=int,
+    parser.add_argument('--max_input_length', default=2048, type=int,
                         help="Max token num for input feature")
     parser.add_argument('--max_generation_length', default=50, type=int,
                         help="Max token num for generating when evaluate")
@@ -215,11 +206,13 @@ def main():
 
     # build model
     generator, tokenizer = build_model(args)
+    tokenizer_name = Path(args.model_name_or_path).parts[-1]
+    
     all_eval_examples = {
-        "ours_suffix": load_dataset("ours_suffix", tokenizer, args),
-        "ours": load_dataset("ours", tokenizer, args),
-        "cceval_python": load_dataset("cceval_python", tokenizer, args),
-        "repoeval_line": load_dataset("repoeval_line", tokenizer, args)
+        "ours_suffix": load_dataset("ours-suffix", tokenizer_name, args),
+        "ours": load_dataset("ours", tokenizer_name, args),
+        "cceval_python": load_dataset("cceval", tokenizer_name, args),
+        "repoeval_line": load_dataset("repoeval", tokenizer_name, args)
     }
     
     with open(f"{args.output_dir}/retrieval.pkl", 'wb') as f:
@@ -231,7 +224,7 @@ def main():
         generator = torch.nn.DataParallel(generator)
     
     if args.do_train:
-        data = load_dataset(args.train_filename, tokenizer, args)
+        data = load_dataset(args.train_filename, tokenizer_name, args)
         train_data = data[:int(len(data)*0.9)]
         valid_data = data[int(len(data)*0.9):]
         train_features = []

@@ -1,14 +1,12 @@
-import random
 import pandas as pd
 import tokenize
 import io
 import re
 import os
-from fastbm25 import fastbm25
+import rank_bm25
+import pickle
 from typing import Tuple, List, Dict
-from torch import FloatTensor, LongTensor
-from transformers import AutoTokenizer, PreTrainedTokenizer
-from transformers.generation.stopping_criteria import StoppingCriteria
+from transformers import PreTrainedTokenizer
 
 class Example:
     def __init__(self, task_id:str, prefix:str, suffix:str, middle:str, relevant_codes:List["CodeBlock"]) -> None:
@@ -18,86 +16,16 @@ class Example:
         self.middle = middle
         self.relevant_code = relevant_codes
 
-def load_train_and_valid_dataset(dataset_path:str) -> Tuple[List[List[Tuple[str, str]]], List[List[Tuple[str, str]]]]:
-    """
-    Loads the dataset.
-    :return: The training dataset and validation dataset.
-    """
-    training_datasets = []
-    validation_datasets = []
-    data_frame = pd.read_parquet(dataset_path)
-    all_data = []
-    temp_data = []
-    for x in data_frame[["path", "content", "first"]].values:
-        # get the value in "first" column and start of a new data if it is true
-        if x[-1]:
-            # end the last data
-            if len(temp_data) > 1:
-                all_data.append(temp_data)
-            temp_data = []
-        temp_data.append([x[0], x[1]])
-    # append the last data
-    if temp_data:
-        all_data.append(temp_data)
-    
-    random.shuffle(all_data)
-    training_datasets = all_data[:int(len(all_data) * 0.9)]
-    validation_datasets = all_data[int(len(all_data) * 0.9):]
-
-    return training_datasets, validation_datasets
-
-def load_dataset(datasetname:str, tokenizer, args) -> List[Example]:
-    """
-    Loads a dataset.
-    :param datasetname: The name of the dataset to load.
-    :return: The loaded dataset.
-    """
-    if os.path.exists(datasetname):
-        data_frame = pd.read_json(datasetname)
-    elif datasetname == "cceval_python":
-        data_frame = pd.read_parquet("data/cceval/python/test.parquet")
-    elif datasetname == "repoeval_line":
-        data_frame_parts = []
-        data_frame_parts.append(pd.read_parquet("data/repoeval/line_level/test_0.parquet"))
-        data_frame_parts.append(pd.read_parquet("data/repoeval/line_level/test_1.parquet"))
-        data_frame = pd.concat(data_frame_parts)
-    elif datasetname == "github_projects":
-        data_frame = pd.read_json("data/github_projects/python/train.json")
-    elif datasetname == "ours":
-        data_frame = pd.read_parquet("data/ours/python/test.parquet")
-    elif datasetname == "ours_suffix":
-        data_frame = pd.read_parquet("data/ours/python/test_suffix.parquet")
-    else:
-        raise Exception("Unsupport dataset name")
-    
-    datasets = []
-    for item in data_frame[["task_id", "path", "left_context", "right_context", "crossfile_context", "groundtruth"]].values:
-        cross_files = item[4] if len(item[4]) > 0 else [{'path': "", "text": "Don't need cross file context for completion"}]
-        cross_files = [CodeBlock(x["path"], x["text"]) for x in cross_files]
-        code_blocks:List[CodeBlock] = []
-        for file in cross_files:
-            code_blocks.extend(split_into_smaller_blocks(file, args.enable_fixed_block))
-        
-        prefix_line = item[2].split("\n")
-        # 处理前缀部分：最多取8行
-        prefix_part = prefix_line[-8:] if len(prefix_line) >= 8 else prefix_line
-        remaining = 15 - len(prefix_part)  # 计算需要从后缀补充的行数
-
-        # 处理后缀部分：过滤空行并取剩余需要的行数
-        suffix_line_clean = [line for line in item[3].split('\n') if line.strip()]
-        suffix_part = suffix_line_clean[:remaining]
-
-        # 合并结果
-        query_str = "\n".join(prefix_part + suffix_part)
-        result = bm25_retrieve(query_str, [code_block.code_content for code_block in code_blocks], tokenizer, args.relevant_code_num)
-        retrieved_codeblocks = [code_blocks[x[1]] for x in result]
-        
-        if datasetname == "repoeval_line":
-            datasets.append(Example(item[0], item[2]+"\n", item[3], item[5], retrieved_codeblocks))
-        else:
-            datasets.append(Example(item[0], item[2], item[3], item[5], retrieved_codeblocks))
-    
-    return datasets
+class InputFeatures(object):
+    """A single training/test features for a example."""
+    def __init__(self,
+                 input_ids:List[int],
+                 attention_mask:List[int],
+                 target_ids:List[int]
+    ):
+        self.input_ids = input_ids
+        self.attention_mask = attention_mask
+        self.target_ids = target_ids
 
 class CodeBlock(object):
     def __init__(self, file_path:str, code_content:str):
@@ -111,6 +39,18 @@ class CodeBlock(object):
 
     def __str__(self):
         return self.code_content
+
+def load_dataset(datasetname:str, tokenizer_name, args) -> List[Example]:
+    """
+    Loads a dataset.
+    :param datasetname: The name of the dataset to load.
+    :return: The loaded dataset.
+    """
+    file_name = f"{datasetname}-{tokenizer_name}-{args.relevant_code_num}.pkl"
+    with open(f"preprocessed/{file_name}", 'rb') as f:
+        dataset = pickle.load(f)
+    
+    return dataset
     
 def label_line(code:str) -> List[Tuple[List[int], bool]]:
     stack = []
@@ -240,33 +180,15 @@ def split_word(word:str) -> List[str]:
             
     return [word.lower() for word in words]
 
-# 模型生成的停止条件
-class StopAtSpecificTokenCriteria(StoppingCriteria):
-    def __init__(self, token_id_list: List[int]) -> None:
-        super().__init__()
-        self.token_id_list = token_id_list
-        
-    def __call__(self, input_ids: LongTensor, scores: FloatTensor, **kwargs):
-        return input_ids[0][-1].detach().cpu().numpy() in self.token_id_list
-
-# 获得所有以\n结尾的token_id
-def get_NL_list(tokenizer:AutoTokenizer) -> List[int]:
-    NL_list = []
-    for _, id in tokenizer.vocab.items():
-        token = tokenizer.decode(id)
-        if token.endswith("\n"):
-            NL_list.append(id)
-    return NL_list
-
 def bm25_retrieve(query_str:str, candidate_str:List[str], tokenizer:PreTrainedTokenizer, k:int):
     if k == 0 or len(candidate_str) == 0:
         return []
     # TODO: 将检索使用的token数量设置为一个参数
-    tokenized_corpus = [tokenizer.tokenize(doc)[:200] for doc in candidate_str]
-    bm25_model = fastbm25(tokenized_corpus)
-    query = tokenizer.tokenize(query_str)[:200]
-    result = bm25_model.top_k_sentence(query, k=k)
-    return result
+    tokenized_corpus = [tokenizer.tokenize(doc) for doc in candidate_str]
+    bm25_model = rank_bm25.BM25Okapi(tokenized_corpus)
+    query = tokenizer.tokenize(query_str)
+    doc_scores = bm25_model.get_scores(query)
+    return doc_scores
 
 def cross_file_contexts(related_codes:List[CodeBlock], tokenizer:PreTrainedTokenizer, cross_file_budget:int) -> Dict[str, List[int]]:
     filter_codeblocks = []
@@ -274,7 +196,7 @@ def cross_file_contexts(related_codes:List[CodeBlock], tokenizer:PreTrainedToken
         file_path = x.file_path
         code_content = x.code_content
         # TODO: 真的需要把file path也附加上去吗
-        if file_path != "":
+        if file_path != "" and file_path != "Unknown":
             filter_codeblocks.append(f"#{file_path}\n{code_content}" if code_content.endswith("\n") else f"#{file_path}\n{code_content}\n")
         else:
             break
