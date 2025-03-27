@@ -5,14 +5,14 @@ import logging
 import argparse
 import json
 import numpy as np
-import pickle
+from pathlib import Path
 from tqdm import tqdm
 from typing import List
 from torch.utils.data import DataLoader, Dataset, RandomSampler
 from transformers import (AdamW, get_linear_schedule_with_warmup)
 
 from utils.util import (load_dataset, set_seed, convert_example_to_feature,
-                        InputFeatures, Benchmarks)
+                        InputFeatures, Benchmarks, CodeBlock)
 from model import (build_model, Generator, Retriever)
 from eval import compute_metric_stmt
 
@@ -69,7 +69,7 @@ def test(benchmark:Benchmarks, names:List[str], generator:Generator, retriever:R
             results = compute_metric_stmt(f"{args.output_dir}/result_{epoch}/{name}", "data/ours/python/test.jsonl")
         elif name == "ours_suffix":
             results = compute_metric_stmt(f"{args.output_dir}/result_{epoch}/{name}", "data/ours/python/test_suffix.jsonl")
-        elif name == "github_projects":
+        elif name == "validation":
             targets, generations = ["".join(x.middle.split()) for x in benchmark.test_datasets[name]], ["".join(x.split()) for x in generations]
             results = {}
             results["em"] = round(sum([1 if x[:min(len(y),len(x))] == y[:min(len(y),len(x))] else 0 for x,y in zip(generations, targets)])/len(generations)*100,4)
@@ -134,9 +134,9 @@ def main():
                         help="Split code into blocks by fixed line")
     parser.add_argument('--relevant_code_num', default=3, type=int,
                         help="Total number of relevant code blocks to use")
-    parser.add_argument('--max_input_length', default=1024, type=int,
+    parser.add_argument('--max_input_length', default=2048, type=int,
                         help="Max token num for input feature")
-    parser.add_argument('--max_crossfile_length', default=512, type=int,
+    parser.add_argument('--max_crossfile_length', default=1536, type=int,
                         help="Max token num for crossfile")
     parser.add_argument('--max_generation_length', default=50, type=int,
                         help="Max token num for generating when evaluate")
@@ -177,49 +177,29 @@ def main():
         "repoeval_line"
     ]
     
-    generator_name = args.generator_name_or_path.split('/')[-1]
-    benchmark_ckp = f"intermediate/{args.relevant_code_num}-{generator_name}-{args.enable_fixed_block}-test.pkl"
-    benchmark = Benchmarks(None, generator.tokenizer, args)
-    if os.path.exists(benchmark_ckp):
-        with open(benchmark_ckp, "rb") as f:
-            logger.info(f"loading from {benchmark_ckp}")
-            benchmark.test_features = pickle.load(f)
-            benchmark.test_features.pop("github_projects", None)
+    tokenizer_name = Path(args.generator_name_or_path).parts[-1]
+    benchmark = Benchmarks(generator.tokenizer, args)
     
     logger.info("Training/evaluation parameters %s", args)
     
     if args.do_train:
-        if "/" in args.train_filename:
-            train_file_name = args.train_filename.split('/')[-1]
-            train_file_name = train_file_name.split('.')[0]
+        data = load_dataset(args.train_filename, tokenizer_name, args.relevant_code_num*5)
+        if args.debug:
+            train_data = data[:int(len(data)*0.02)]
+            valid_data = data[int(len(data)*0.999):]
         else:
-            train_file_name = args.train_filename
-        trainfeature_ckp = f"intermediate/{args.relevant_code_num}-{generator_name}-{args.enable_fixed_block}-{args.debug}-{train_file_name}-train.pkl"
+            train_data = data[:int(len(data)*0.9)]
+            valid_data = data[int(len(data)*0.9):]
+        benchmark.test_datasets["validation"] = valid_data
+        train_features = []
+        for example in tqdm(train_data, desc="convert examples to features"):
+            # 这种数据没有学习意义
+            if len(example.relevant_code) < 1:
+                continue
+            train_feature = convert_example_to_feature(example.prefix, example.suffix, example.middle, \
+                example.relevant_code, generator.tokenizer, args)
+            train_features.append(train_feature)
         
-        if os.path.exists(trainfeature_ckp):
-            with open(trainfeature_ckp, "rb") as f:
-                logger.info(f"loading from {trainfeature_ckp}")
-                train_features, valid_data = pickle.load(f)
-            benchmark.test_datasets["github_projects"] = valid_data
-        else:
-            data = load_dataset(args.train_filename)
-            if args.debug:
-                train_data = data[:int(len(data)*0.02)]
-                valid_data = data[int(len(data)*0.999):]
-            else:
-                train_data = data[:int(len(data)*0.9)]
-                valid_data = data[int(len(data)*0.9):]
-            benchmark.test_datasets["github_projects"] = valid_data
-            train_features = []
-            for example in tqdm(train_data, desc="convert examples to features"):
-                train_feature = convert_example_to_feature(example.prefix, example.suffix, example.middle, \
-                    example.relevant_code, generator.tokenizer, args)
-                if len(train_feature.document) <= 1:
-                    continue
-                train_features.append(train_feature)
-            
-            with open(trainfeature_ckp, "wb") as f:
-                pickle.dump((train_features, valid_data), f)
         train_dataset = MyDataset(train_features)
         train_sampler = RandomSampler(train_dataset)
         train_dataloader = DataLoader(train_dataset, sampler=train_sampler, 
@@ -245,12 +225,7 @@ def main():
         logger.info("  Num epoch = %d", args.num_train_epochs)
         
         losses = []
-        
-        # if args.do_valid and not args.debug:
-        #     test(benchmark, ["github_projects"] + testsets_name, generator, retriever, args, 0)
-        #     if not os.path.exists(benchmark_ckp):
-        #         with open(benchmark_ckp, "wb") as f:
-        #             pickle.dump(benchmark.test_features, f)
+        softmax = torch.nn.Softmax(dim=-1)
         
         for epoch in range(1, args.num_train_epochs+1):
             for batch in train_dataloader:
@@ -271,11 +246,20 @@ def main():
                         )
                         for documents in documents_permutation
                     ]
+                    decoder_features.append(InputFeatures(
+                            feature.prefix_ids,
+                            feature.suffix_ids,
+                            feature.middle_ids,
+                            document=[CodeBlock("Unknown", "")]
+                    ))
                     
                     with torch.no_grad():
                         feature_loss = generator.generate(decoder_features, True)
                     
-                    current_loss = torch.dot(scores, feature_loss)
+                    base_score = torch.tensor([0.5], dtype=scores.dtype, device=scores.device)
+                    full_score = torch.cat([scores, base_score])
+                    full_score = softmax(full_score)
+                    current_loss = torch.dot(full_score, feature_loss)
                     loss = current_loss if loss is None else loss + current_loss
                 
                 if args.gradient_accumulation_steps > 1:
@@ -288,21 +272,16 @@ def main():
                     optimizer.zero_grad()
                     scheduler.step()
                     if len(losses) // args.gradient_accumulation_steps % 100 == 0:
+                        logger.info(f"{scores}")
                         logger.info("epoch {} step {} loss {}".format(epoch,
                                                      len(losses)//args.gradient_accumulation_steps,
                                                      round(np.mean(losses[-100*args.gradient_accumulation_steps:]),4)))
         
             if args.do_valid:
-                test(benchmark, ["github_projects"] + testsets_name, generator, retriever, args, epoch)
-                if not os.path.exists(benchmark_ckp):
-                    with open(benchmark_ckp, "wb") as f:
-                        pickle.dump(benchmark.test_features, f)
+                test(benchmark, ["validation"] + testsets_name, generator, retriever, args, epoch)
     
     if args.do_test and not args.do_valid:
         test(benchmark, testsets_name, generator, retriever, args, 0 if not args.do_train else epoch)
-        if not os.path.exists(benchmark_ckp):
-            with open(benchmark_ckp, "wb") as f:
-                pickle.dump(benchmark.test_features, f)
                 
 if __name__ == '__main__':
     main()  

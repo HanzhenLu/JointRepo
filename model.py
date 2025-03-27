@@ -63,15 +63,17 @@ class Retriever:
         permutation_scores = (selected_scores * position_weights).sum(dim=1)
         
         if not is_training:
-            permutation_id = torch.argmax(permutation_scores, dim=-1).cpu()
-            doc_ids = permutations[permutation_id]
-            return [documents[i] for i in doc_ids]
+            max_scores = torch.max(permutation_scores, dim=-1).values
+            if max_scores.item() > 0.5:
+                permutation_id = torch.argmax(permutation_scores, dim=-1).cpu()
+                doc_ids = permutations[permutation_id]
+                return [documents[i] for i in doc_ids]
+            else:
+                return []
         
         samples = [[documents[id] for id in doc_ids] for doc_ids in permutations]
-        softmax = torch.nn.Softmax(dim=-1)
-        scores = softmax(permutation_scores)
         
-        return scores, samples
+        return permutation_scores, samples
     
     def eval(self):
         self.model.eval()
@@ -279,14 +281,14 @@ def get_model_size(model):
 
 def build_model(args) -> Tuple[Generator, Retriever]:
     generator = Generator(args.generator_name_or_path, args)
-    if "unixocder" in args.retriever_name_or_path.lower():
+    if args.retriever_name_or_path is None:
+        retriever = None
+    elif "unixocder" in args.retriever_name_or_path.lower():
         logger.info("Using child class UnixcoderForRetriever !!!")
         retriever = UnixcoderForRetriever(args.retriever_name_or_path)
     elif "jina" in args.retriever_name_or_path.lower():
         logger.info("Using child class JinaForRetriever !!!")
         retriever = JinaForRetriever(args.retriever_name_or_path)
-    elif args.retriever_name_or_path is None:
-        retriever = None
     else:
         retriever = Retriever(args.retriever_name_or_path)
     
