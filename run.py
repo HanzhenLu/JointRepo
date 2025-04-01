@@ -69,7 +69,7 @@ def test(benchmark:Benchmarks, names:List[str], generator:Generator, retriever:R
             results = compute_metric_stmt(f"{args.output_dir}/result_{epoch}/{name}", "data/ours/python/test.jsonl")
         elif name == "ours_suffix":
             results = compute_metric_stmt(f"{args.output_dir}/result_{epoch}/{name}", "data/ours/python/test_suffix.jsonl")
-        elif name == "validation":
+        elif name == "validation" or name == "train":
             targets, generations = ["".join(x.middle.split()) for x in benchmark.test_datasets[name]], ["".join(x.split()) for x in generations]
             results = {}
             results["em"] = round(sum([1 if x[:min(len(y),len(x))] == y[:min(len(y),len(x))] else 0 for x,y in zip(generations, targets)])/len(generations)*100,4)
@@ -130,8 +130,6 @@ def main():
     parser.add_argument('--GPU_ids', type=str, default='0',
                         help="The ids of GPUs will be used")
     
-    parser.add_argument('--enable_fixed_block', action='store_true',
-                        help="Split code into blocks by fixed line")
     parser.add_argument('--relevant_code_num', default=3, type=int,
                         help="Total number of relevant code blocks to use")
     parser.add_argument('--max_input_length', default=2048, type=int,
@@ -185,12 +183,14 @@ def main():
     if args.do_train:
         data = load_dataset(args.train_filename, tokenizer_name, args.relevant_code_num*5)
         if args.debug:
-            train_data = data[:int(len(data)*0.02)]
+            train_data = data[:int(len(data)*0.04)]
             valid_data = data[int(len(data)*0.999):]
         else:
             train_data = data[:int(len(data)*0.9)]
+            # train_data = data
             valid_data = data[int(len(data)*0.9):]
         benchmark.test_datasets["validation"] = valid_data
+        benchmark.test_datasets["train"] = data[int(len(data)*0.8):int(len(data)*0.9)]
         train_features = []
         for example in tqdm(train_data, desc="convert examples to features"):
             # 这种数据没有学习意义
@@ -226,6 +226,10 @@ def main():
         
         losses = []
         softmax = torch.nn.Softmax(dim=-1)
+        negative_document = None
+        
+        # if args.do_valid:
+        #     test(benchmark, ["train", "validation"], generator, retriever, args, 0)
         
         for epoch in range(1, args.num_train_epochs+1):
             for batch in train_dataloader:
@@ -235,6 +239,8 @@ def main():
                 loss = None
                 for feature in batch:
                     feature:InputFeatures
+                    if negative_document is not None and epoch == 1:
+                        feature.document.append(negative_document)
                     scores, documents_permutation = retriever.retrieve(feature.query, feature.document, 
                                                                        args.relevant_code_num)
                     decoder_features = [
@@ -246,20 +252,14 @@ def main():
                         )
                         for documents in documents_permutation
                     ]
-                    decoder_features.append(InputFeatures(
-                            feature.prefix_ids,
-                            feature.suffix_ids,
-                            feature.middle_ids,
-                            document=[CodeBlock("Unknown", "")]
-                    ))
                     
                     with torch.no_grad():
                         feature_loss = generator.generate(decoder_features, True)
                     
-                    base_score = torch.tensor([0.5], dtype=scores.dtype, device=scores.device)
-                    full_score = torch.cat([scores, base_score])
-                    full_score = softmax(full_score)
-                    current_loss = torch.dot(full_score, feature_loss)
+                    negative_document = feature.document[0]
+
+                    modified_score = softmax(scores)
+                    current_loss = torch.dot(modified_score, feature_loss)
                     loss = current_loss if loss is None else loss + current_loss
                 
                 if args.gradient_accumulation_steps > 1:
@@ -278,7 +278,7 @@ def main():
                                                      round(np.mean(losses[-100*args.gradient_accumulation_steps:]),4)))
         
             if args.do_valid:
-                test(benchmark, ["validation"] + testsets_name, generator, retriever, args, epoch)
+                test(benchmark, ["train", "validation"] + testsets_name, generator, retriever, args, epoch)
     
     if args.do_test and not args.do_valid:
         test(benchmark, testsets_name, generator, retriever, args, 0 if not args.do_train else epoch)

@@ -26,7 +26,7 @@ def main():
     
     parser.add_argument("--relevant_code_num", type=int, default=5)
     parser.add_argument("--dataset_name", type=str, required=True)
-    parser.add_argument("--output_examples_num", type=int, default=10000)
+    parser.add_argument("--output_examples_num", type=int, default=100000)
     args = parser.parse_args()
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -95,7 +95,7 @@ def main():
                 if len(filter_examples) >= args.output_examples_num:
                     break
     
-    with open(f"preprocessed/filted-{args.dataset_name}-{tokenizer_name}-{args.relevant_code_num}.pkl", 'wb') as f:
+    with open(f"preprocessed/filted-{args.dataset_name}-{tokenizer_name}-{args.relevant_code_num}-{args.output_examples_num}.pkl", 'wb') as f:
         pickle.dump(filter_examples, f)
 
 if __name__ == "__main__":

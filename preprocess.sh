@@ -1,5 +1,5 @@
-TOKENIZED_PATH="/data/hanzhenlu/LLaMA-Factory/saves/opc-sft-v1"
-TRAIN_FILE_PATH="data/github_projects/python/train_03_18.json"
+TOKENIZED_PATH="/nasdata/Model/deepseek-coder-1.3b-base/"
+TRAIN_FILE_PATH="data/github_projects/python/filter_train_data.json"
 TRAIN_BM25_REtRIEVAL_CODE_NUM=5
 TEST_BM25_RETRIEVAL_CODE_NUM=10
 

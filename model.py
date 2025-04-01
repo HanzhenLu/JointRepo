@@ -63,13 +63,9 @@ class Retriever:
         permutation_scores = (selected_scores * position_weights).sum(dim=1)
         
         if not is_training:
-            max_scores = torch.max(permutation_scores, dim=-1).values
-            if max_scores.item() > 0.5:
-                permutation_id = torch.argmax(permutation_scores, dim=-1).cpu()
-                doc_ids = permutations[permutation_id]
-                return [documents[i] for i in doc_ids]
-            else:
-                return []
+            permutation_id = torch.argmax(permutation_scores, dim=-1).cpu()
+            doc_ids = permutations[permutation_id]
+            return [documents[i] for i in doc_ids]
         
         samples = [[documents[id] for id in doc_ids] for doc_ids in permutations]
         
@@ -111,19 +107,6 @@ class UnixcoderForRetriever(Retriever):
         mask = source_ids.ne(self.tokenizer.pad_token_id).to("cuda")
         token_embeddings = self.model(source_ids, attention_mask=mask)[0]
         sentence_embeddings = (token_embeddings * mask.unsqueeze(-1)).sum(1) / mask.sum(-1).unsqueeze(-1)
-        sentence_embeddings = torch.nn.functional.normalize(sentence_embeddings, p=2, dim=1)
-        return sentence_embeddings
-
-class JinaForRetriever(Retriever):
-    def __init__(self, model_name_or_path:str):
-        self.model = AutoModel.from_pretrained(model_name_or_path, trust_remote_code=True)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-    def embedding(self, input_str, is_query):
-        sentence_embeddings = self.model.encode(input_str)
-        sentence_embeddings = torch.tensor(sentence_embeddings)
-        if isinstance(input_str, str):
-            sentence_embeddings = sentence_embeddings.unsqueeze(0)
         sentence_embeddings = torch.nn.functional.normalize(sentence_embeddings, p=2, dim=1)
         return sentence_embeddings
     
@@ -286,9 +269,6 @@ def build_model(args) -> Tuple[Generator, Retriever]:
     elif "unixocder" in args.retriever_name_or_path.lower():
         logger.info("Using child class UnixcoderForRetriever !!!")
         retriever = UnixcoderForRetriever(args.retriever_name_or_path)
-    elif "jina" in args.retriever_name_or_path.lower():
-        logger.info("Using child class JinaForRetriever !!!")
-        retriever = JinaForRetriever(args.retriever_name_or_path)
     else:
         retriever = Retriever(args.retriever_name_or_path)
     

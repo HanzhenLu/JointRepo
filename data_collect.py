@@ -128,7 +128,7 @@ def construct_data(code_content:str) -> Tuple[str, str, str]:
     
     prefix = "".join([raw_lines[i] for i in range(0, selected_index[0])]) if selected_index[0] > 0 else ""
     suffix = "".join([raw_lines[i] for i in range(selected_index[-1] + 1, len(raw_lines))]) if selected_index[-1] < len(raw_lines) else ""
-    if random.random() > 0.9:
+    if random.random() > 0.8:
         middle = selected_line
     else:
         split_point = random.randint(0, len(selected_line) - 2)
