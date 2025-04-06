@@ -57,10 +57,10 @@ class Benchmarks(dict):
     def __init__(self, tokenizer:AutoTokenizer, args):
         tokenizer_name = Path(args.generator_name_or_path).parts[-1]
         self.test_datasets = {
-            "ours_suffix": load_dataset("ours-suffix", tokenizer_name, args.relevant_code_num*10),
-            "ours": load_dataset("ours", tokenizer_name, args.relevant_code_num*10),
-            "cceval_python": load_dataset("cceval", tokenizer_name, args.relevant_code_num*10),
-            "repoeval_line": load_dataset("repoeval", tokenizer_name, args.relevant_code_num*10)
+            "ours_suffix": load_dataset("ours-suffix", tokenizer_name, args.sampled_code_num*5),
+            "ours": load_dataset("ours", tokenizer_name, args.sampled_code_num*5),
+            "cceval_python": load_dataset("cceval", tokenizer_name, args.sampled_code_num*5),
+            "repoeval_line": load_dataset("repoeval", tokenizer_name, args.sampled_code_num*5)
         }
         self.test_features = {}
         self.tokenizer = tokenizer
@@ -241,6 +241,9 @@ def bm25_retrieve(query_str:str, candidate_str:List[str], tokenizer:PreTrainedTo
 
 def get_cross_file_context(related_codes:List[CodeBlock], tokenizer:PreTrainedTokenizer, cross_file_budget:int) -> Dict[str, List[int]]:
     filter_codeblocks = []
+    
+    assert len(related_codes) <= 1
+    
     for x in related_codes:
         file_path = x.file_path
         code_content = x.code_content
@@ -250,18 +253,18 @@ def get_cross_file_context(related_codes:List[CodeBlock], tokenizer:PreTrainedTo
         else:
             break
     
-    if len(filter_codeblocks) > 0:
-        related_tokenized_result = tokenizer(filter_codeblocks, add_special_tokens=False)
-    
     repo_content = {
         "input_ids": [],
         "attention_mask": []
     }
-    related_idx = 0
-    while related_idx < len(filter_codeblocks) and len(repo_content["input_ids"]) + len(related_tokenized_result["input_ids"][related_idx]) < cross_file_budget:
-        repo_content["input_ids"].extend(related_tokenized_result["input_ids"][related_idx])
-        repo_content["attention_mask"].extend(related_tokenized_result["attention_mask"][related_idx])
-        related_idx += 1
+    
+    if len(filter_codeblocks) > 0:
+        related_tokenized_result = tokenizer(filter_codeblocks, add_special_tokens=False)
+    else:
+        return repo_content
+    
+    repo_content["input_ids"] = related_tokenized_result["input_ids"][0][:cross_file_budget]
+    repo_content["attention_mask"] = related_tokenized_result["attention_mask"][0][:cross_file_budget]
     
     return repo_content
 

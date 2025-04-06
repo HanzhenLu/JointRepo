@@ -32,44 +32,43 @@ class Retriever:
         embedding = torch.nn.functional.normalize(embedding, p=2, dim=1)
         return embedding
     
-    def retrieve(self, query_str:str, documents:List[CodeBlock], n:int, is_training:bool=True) \
-        -> Union[Tuple[torch.Tensor, Dict], List[str]]:
+    def retrieve(self, query_str:str, documents:List[CodeBlock], n:int=None, is_training:bool=True) \
+        -> Union[torch.Tensor, List[CodeBlock]]:
         r'''
-        返回候选文档每种排列被采样到的次数，以及被采样到的排列下标与检索内容之间的映射
         Params:
             query_str:用于检索的字符串
             document_str:被检索的文档合集
-            n:检索返回的最大文档数量
+            is_training:训练时返回各个document的分数；非训练时返回分数最高的n个document
         '''
-        if len(documents) == 0:
-            return []
-        
-        # 提供的文档数可能小于需要的文档数
-        n = min(n, len(documents))
-        
-        query_embedding = self.embedding(query_str, True)
-        document_embedding = self.embedding([doc.code_content for doc in documents], False)
-        scores = torch.matmul(query_embedding, document_embedding.T).squeeze(dim=0)
-        
-        permutations = list(itertools.permutations(range(len(documents)), n))
-        perm_tensor = torch.tensor(permutations)
-        
-        position_weights = torch.tensor([1/(i+1) for i in range(n)]).to(scores.device)
-        
-        selected_scores = scores[perm_tensor]
-        # 因为这里已经将所有被检索目标的分数都添加到一起了，
-        # 所以后面一定要使用到，不然就会发生偏差
-        # 一个更好的方法是允许不检索任何内容
-        permutation_scores = (selected_scores * position_weights).sum(dim=1)
         
         if not is_training:
-            permutation_id = torch.argmax(permutation_scores, dim=-1).cpu()
-            doc_ids = permutations[permutation_id]
-            return [documents[i] for i in doc_ids]
+            assert n is not None
+            
+            if len(documents) == 0:
+                return []
+            
+            # 提供的文档数可能小于需要的文档数
+            n = min(n, len(documents))
+            
+            self.eval()
+            with torch.no_grad():
+                query_embedding = self.embedding(query_str, True)
+                document_embedding = self.embedding([doc.code_content for doc in documents], False)
+                scores = torch.matmul(query_embedding, document_embedding.T).squeeze(dim=0)
+            self.train()
+            
+            _, top_indices = torch.topk(scores, n)
+            top_indices = top_indices.cpu().tolist()
+            return [documents[i] for i in top_indices]
         
-        samples = [[documents[id] for id in doc_ids] for doc_ids in permutations]
+        else:
+            assert len(documents) != 0
+            
+            query_embedding = self.embedding(query_str, True)
+            document_embedding = self.embedding([doc.code_content for doc in documents], False)
+            scores = torch.matmul(query_embedding, document_embedding.T).squeeze(dim=0)
         
-        return permutation_scores, samples
+            return scores
     
     def eval(self):
         self.model.eval()
@@ -143,9 +142,11 @@ class Generator:
             # 处理跨文件上下文
             cross_file_context = get_cross_file_context(feature.document, self.tokenizer, self.args.max_crossfile_length)
             
+            middle_ids = feature.middle_ids[:self.args.max_generation_length]
+            
             # 计算分配长度
             if is_training:
-                max_allocated_length = self.args.max_input_length - len(cross_file_context["input_ids"]) - len(feature.middle_ids) - 5
+                max_allocated_length = self.args.max_input_length - len(cross_file_context["input_ids"]) - len(middle_ids) - 5
             else:
                 max_allocated_length = self.args.max_input_length - len(cross_file_context["input_ids"]) - 4
             prefix_length = max_allocated_length // 2
@@ -169,15 +170,15 @@ class Generator:
                 if "opc" in self.args.generator_name_or_path or "llama" in self.args.generator_name_or_path:
                     input_ids = [self.special_token_ids["suffix_id"]] + suffix_ids + [self.special_token_ids["prefix_id"]] \
                         + cross_file_context["input_ids"] + prefix_ids + [self.special_token_ids["middle_id"]] + \
-                            feature.middle_ids + [self.special_token_ids["eos_id"]]
+                            middle_ids + [self.special_token_ids["eos_id"]]
                     
                 elif "deepseek" in self.args.generator_name_or_path:
                     input_ids = [32013] + [self.special_token_ids["prefix_id"]] + cross_file_context["input_ids"] \
                         + prefix_ids + [self.special_token_ids["middle_id"]] + suffix_ids + [self.special_token_ids["suffix_id"]] \
-                        + feature.middle_ids + [self.special_token_ids["eos_id"]]
+                        + middle_ids + [self.special_token_ids["eos_id"]]
                 
-                labels = [-100] * (len(input_ids) - len(feature.middle_ids) - 1) \
-                    + feature.middle_ids + [self.special_token_ids["eos_id"]]
+                labels = [-100] * (len(input_ids) - len(middle_ids) - 1) \
+                    + middle_ids + [self.special_token_ids["eos_id"]]
                 attention_mask = [1] * len(input_ids)
                 padding_length = self.args.max_input_length - len(input_ids)
                 input_ids += [self.tokenizer.pad_token_id] * padding_length
