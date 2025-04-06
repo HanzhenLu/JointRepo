@@ -161,20 +161,18 @@ def main():
                         help="Epsilon for Adam optimizer.")
     parser.add_argument("--max_grad_norm", default=1.0, type=float,
                         help="Max gradient norm.")
-    parser.add_argument("--num_train_epochs", default=3, type=int,
+    parser.add_argument("--num_train_epochs", default=1, type=int,
                         help="Total number of training epochs to perform.") 
     parser.add_argument('--seed', type=int, default=42,
                         help="random seed for initialization")
     parser.add_argument('--GPU_ids', type=str, default='0',
                         help="The ids of GPUs will be used")
     
-    parser.add_argument('--enable_fixed_block', action='store_true',
-                        help="Split code into blocks by fixed line")
-    parser.add_argument('--relevant_code_num', default=3, type=int,
+    parser.add_argument('--relevant_code_num', default=1, type=int,
                         help="Total number of relevant code blocks to use")
     parser.add_argument('--max_input_length', default=2048, type=int,
                         help="Max token num for input feature")
-    parser.add_argument('--max_generation_length', default=50, type=int,
+    parser.add_argument('--max_generation_length', default=64, type=int,
                         help="Max token num for generating when evaluate")
     
     # print arguments
@@ -209,10 +207,10 @@ def main():
     tokenizer_name = Path(args.model_name_or_path).parts[-1]
     
     all_eval_examples = {
-        "ours_suffix": load_dataset("ours-suffix", tokenizer_name, args),
-        "ours": load_dataset("ours", tokenizer_name, args),
-        "cceval_python": load_dataset("cceval", tokenizer_name, args),
-        "repoeval_line": load_dataset("repoeval", tokenizer_name, args)
+        "ours": load_dataset("ours", tokenizer_name, args.relevant_code_num),
+        "ours_suffix": load_dataset("ours-suffix", tokenizer_name, args.relevant_code_num),
+        "cceval_python": load_dataset("cceval", tokenizer_name, args.relevant_code_num),
+        "repoeval_line": load_dataset("repoeval", tokenizer_name, args.relevant_code_num)
     }
     
     with open(f"{args.output_dir}/retrieval.pkl", 'wb') as f:

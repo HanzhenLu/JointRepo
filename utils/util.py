@@ -40,13 +40,13 @@ class CodeBlock(object):
     def __str__(self):
         return self.code_content
 
-def load_dataset(datasetname:str, tokenizer_name, args) -> List[Example]:
+def load_dataset(datasetname:str, tokenizer_name:str, k:int) -> List[Example]:
     """
     Loads a dataset.
     :param datasetname: The name of the dataset to load.
     :return: The loaded dataset.
     """
-    file_name = f"{datasetname}-{tokenizer_name}-{args.relevant_code_num}.pkl"
+    file_name = f"{datasetname}-{tokenizer_name}-{k}.pkl"
     with open(f"preprocessed/{file_name}", 'rb') as f:
         dataset = pickle.load(f)
     
@@ -201,17 +201,17 @@ def cross_file_contexts(related_codes:List[CodeBlock], tokenizer:PreTrainedToken
         else:
             break
     
-    if len(filter_codeblocks) > 0:
-        related_tokenized_result = tokenizer(filter_codeblocks, add_special_tokens=False)
-    
     repo_content = {
         "input_ids": [],
         "attention_mask": []
     }
-    related_idx = 0
-    while related_idx < len(filter_codeblocks) and len(repo_content["input_ids"]) + len(related_tokenized_result["input_ids"][related_idx]) < cross_file_budget:
-        repo_content["input_ids"].extend(related_tokenized_result["input_ids"][related_idx])
-        repo_content["attention_mask"].extend(related_tokenized_result["attention_mask"][related_idx])
-        related_idx += 1
+    
+    if len(filter_codeblocks) > 0:
+        related_tokenized_result = tokenizer(filter_codeblocks, add_special_tokens=False)
+    else:
+        return repo_content
+    
+    repo_content["input_ids"] = related_tokenized_result["input_ids"][0][:cross_file_budget]
+    repo_content["attention_mask"] = related_tokenized_result["attention_mask"][0][:cross_file_budget]
     
     return repo_content

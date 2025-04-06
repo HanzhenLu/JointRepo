@@ -12,8 +12,7 @@ from typing import List, Dict
 from torch.utils.data import Dataset
 from transformers import (PreTrainedTokenizer, PreTrainedModel)
 
-from utils.util import (load_dataset,
-                        CodeBlock, Example)
+from utils.util import (CodeBlock, Example)
 from model import (build_model, generate)
 from eval import compute_metric_stmt
 
@@ -132,13 +131,13 @@ def main():
     tokenizer_name = Path(args.model_name_or_path).parts[-1]
     
     all_eval_examples = {}
-    with open("preprocessed/cceval-opc-sft-v1-1.pkl", 'rb') as f:
+    with open(f"preprocessed/cceval-{tokenizer_name}-{args.relevant_code_num}.pkl", 'rb') as f:
         all_eval_examples["cceval_python"] = pickle.load(f)
-    with open("preprocessed/ours-opc-sft-v1-1.pkl", 'rb') as f:
+    with open(f"preprocessed/ours-{tokenizer_name}-{args.relevant_code_num}.pkl", 'rb') as f:
         all_eval_examples["ours"] = pickle.load(f)
-    with open("preprocessed/ours-suffix-opc-sft-v1-1.pkl", 'rb') as f:
+    with open(f"preprocessed/ours-suffix-{tokenizer_name}-{args.relevant_code_num}.pkl", 'rb') as f:
         all_eval_examples["ours_suffix"] = pickle.load(f)
-    with open("preprocessed/repoeval-opc-sft-v1-1.pkl", 'rb') as f:
+    with open(f"preprocessed/repoeval-{tokenizer_name}-{args.relevant_code_num}.pkl", 'rb') as f:
         all_eval_examples["repoeval_line"] = pickle.load(f)
     
     with open(f"{args.output_dir}/retrieval.pkl", 'wb') as f:

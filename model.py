@@ -8,7 +8,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, PreTrainedModel, P
 from torch.utils.data import DataLoader, Dataset, SequentialSampler
 from typing import Tuple, List
 
-from utils.util import Example, split_into_smaller_blocks, CodeBlock, bm25_retrieve, cross_file_contexts
+from utils.util import Example, cross_file_contexts
 
 logger = logging.getLogger(__name__)
 
@@ -49,11 +49,22 @@ class CustomDataset(Dataset):
         self.args = args
         self.tokenizer = tokenizer
         self.examples = examples
-        self.special_tokens = {
-            "prefix_id": tokenizer.convert_tokens_to_ids("<PREFIX>"),
-            "suffix_id": tokenizer.convert_tokens_to_ids("<SUFFIX>"),
-            "middle_id": tokenizer.convert_tokens_to_ids("<MIDDLE>")
-        }
+        if "opc" in args.model_name_or_path or "llama" in args.model_name_or_path:
+            self.special_token_ids = {
+                "prefix_id": self.tokenizer.convert_tokens_to_ids("<PREFIX>"),
+                "suffix_id": self.tokenizer.convert_tokens_to_ids("<SUFFIX>"),
+                "middle_id": self.tokenizer.convert_tokens_to_ids("<MIDDLE>"),
+                "eos_id": self.tokenizer.convert_tokens_to_ids("<EOS>")
+            }
+        elif "deepseek" in args.model_name_or_path:
+            self.special_token_ids = {
+                "prefix_id": self.tokenizer.convert_tokens_to_ids("<｜fim▁begin｜>"),
+                "suffix_id": self.tokenizer.convert_tokens_to_ids("<｜fim▁end｜>"),
+                "middle_id": self.tokenizer.convert_tokens_to_ids("<｜fim▁hole｜>"),
+                "eos_id": self.tokenizer.eos_token_id
+            }
+        else:
+            raise RuntimeError("Unknown generator")
         self.input_ids = []
         self.attention_mask = []
         for example in tqdm(examples):
@@ -78,7 +89,7 @@ class CustomDataset(Dataset):
         prefix_tokenized_result = self.tokenizer(prefix, add_special_tokens=False)
         suffix_tokenized_result = self.tokenizer(suffix, add_special_tokens=False)
         
-        left_budget = self.args.max_input_length - len(repo_content["input_ids"]) - 3
+        left_budget = self.args.max_input_length - len(repo_content["input_ids"]) - 4
         prefix_length = int(left_budget / 2)
         suffix_length = int(left_budget - prefix_length)
         if len(prefix_tokenized_result["input_ids"]) < prefix_length and len(suffix_tokenized_result["input_ids"]) < suffix_length:
@@ -96,7 +107,12 @@ class CustomDataset(Dataset):
             prefix_ids = prefix_tokenized_result["input_ids"][-prefix_length:]
             suffix_ids = suffix_tokenized_result["input_ids"][:suffix_length]
         
-        input_ids = [self.special_tokens["suffix_id"]] + suffix_ids + [self.special_tokens["prefix_id"]] + repo_content["input_ids"] + prefix_ids + [self.special_tokens["middle_id"]]
+        if "opc" in self.args.model_name_or_path or "llama" in self.args.model_name_or_path:
+            input_ids = [self.special_token_ids["suffix_id"]] + suffix_ids + [self.special_token_ids["prefix_id"]] \
+                + repo_content["input_ids"] + prefix_ids + [self.special_token_ids["middle_id"]]
+        elif "deepseek" in self.args.model_name_or_path:
+            input_ids = [32013] + [self.special_token_ids["prefix_id"]] + repo_content["input_ids"] \
+                + prefix_ids + [self.special_token_ids["middle_id"]] + suffix_ids + [self.special_token_ids["suffix_id"]]
         attention_mask = [1] * len(input_ids)
         padding_length = self.args.max_input_length - len(input_ids)
         input_ids = [self.tokenizer.pad_token_id] * padding_length + input_ids
