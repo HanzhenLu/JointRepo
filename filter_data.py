@@ -19,7 +19,7 @@ def main():
                         help="Max token num for crossfile")
     parser.add_argument('--max_input_length', default=2048, type=int,
                         help="Max token num for input feature")
-    parser.add_argument('--max_generation_length', default=50, type=int,
+    parser.add_argument('--max_generation_length', default=64, type=int,
                         help="Max token num for generating when evaluate")
     parser.add_argument('--GPU_ids', type=str, default='0',
                         help="The ids of GPUs will be used")
@@ -75,27 +75,27 @@ def main():
                 feature.middle_ids,
                 document=[documents]
             )
-            for documents in feature.document
+            for documents in feature.document[:10]
         ]
-        decoder_features.append(InputFeatures(
-                feature.prefix_ids,
-                feature.suffix_ids,
-                feature.middle_ids,
-                document=[CodeBlock("Unknown", "")]
-        ))
+        # decoder_features.append(InputFeatures(
+        #         feature.prefix_ids,
+        #         feature.suffix_ids,
+        #         feature.middle_ids,
+        #         document=[CodeBlock("Unknown", "")]
+        # ))
         
         with torch.no_grad():
             feature_loss = generator.generate(decoder_features, True)
             mean = feature_loss.mean().item()
             std = feature_loss.std().item()
             cv = std / mean
-            if cv > 0.3:
+            if cv > 0.5:
                 # assert examples[idx].relevant_code == feature.document
                 filter_examples.append(examples[idx])
                 if len(filter_examples) >= args.output_examples_num:
                     break
     
-    with open(f"preprocessed/filted-{args.dataset_name}-{tokenizer_name}-{args.relevant_code_num}-{args.output_examples_num}.pkl", 'wb') as f:
+    with open(f"preprocessed/filted-{args.dataset_name}-{tokenizer_name}-{args.relevant_code_num}.pkl", 'wb') as f:
         pickle.dump(filter_examples, f)
 
 if __name__ == "__main__":

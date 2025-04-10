@@ -3,10 +3,9 @@
 import numpy as np
 import logging
 import torch
-import itertools
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel
-from typing import Tuple, List, Union, Dict
+from typing import Tuple, List, Union
 
 from utils.util import (get_cross_file_context,
                         CodeBlock, InputFeatures)
@@ -272,6 +271,10 @@ def build_model(args) -> Tuple[Generator, Retriever]:
         retriever = UnixcoderForRetriever(args.retriever_name_or_path)
     else:
         retriever = Retriever(args.retriever_name_or_path)
+        
+    if args.weighted_parameters is not None:
+        logger.info(f"load parameters from {args.weighted_parameters}")
+        retriever.model.load_state_dict(torch.load(args.weighted_parameters))
     
     generator.model.to(args.device)  
     logger.info("Finish loading generator [%s] from %s", get_model_size(generator.model), args.generator_name_or_path)

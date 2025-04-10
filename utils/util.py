@@ -74,7 +74,7 @@ class Benchmarks(dict):
             for example in tqdm(self.test_datasets[key], desc=f"convert {key} into features"):
                 example:Example
                 features.append(convert_example_to_feature(example.prefix, example.suffix, example.middle, \
-                    example.relevant_code, self.tokenizer, self.args))
+                    example.relevant_code, self.tokenizer))
             self.test_features[key] = features
         else:
             features = self.test_features[key]
@@ -100,7 +100,7 @@ def load_dataset(datasetname:str, tokenizer_name:str, k:int) -> List[Example]:
     
     return dataset
 
-def convert_example_to_feature(prefix:str, suffix:str, middle:str, related_codes:List[CodeBlock], tokenizer:PreTrainedTokenizer, args) -> InputFeatures:
+def convert_example_to_feature(prefix:str, suffix:str, middle:str, related_codes:List[CodeBlock], tokenizer:PreTrainedTokenizer) -> InputFeatures:
     prefix_line = prefix.split("\n")
     # 处理前缀部分：最多取8行
     prefix_part = prefix_line[-8:] if len(prefix_line) >= 8 else prefix_line

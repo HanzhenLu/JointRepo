@@ -118,9 +118,10 @@ def construct_data(code_content:str) -> Tuple[str, str, str]:
     inner_try_count = 0
     
     selected_line = None
-    while (selected_line is None or len(selected_line) > 200 or len(selected_line.strip()) < 5 or check_character_exist(selected_line)) and inner_try_count < 10:
+    while (selected_line is None or len(selected_line) > 200 or len(selected_line.strip()) < 10 or check_character_exist(selected_line)) and inner_try_count < 10:
         selected_index = random.choice(valid_index[1:]) if len(valid_index) > 1 else valid_index[0]
-        selected_line = "".join([raw_lines[i] for i in selected_index])
+        # 清除行末的空格
+        selected_line = "".join([raw_lines[i].rstrip() + "\n" for i in selected_index])
         inner_try_count += 1
     
     if inner_try_count == 10 or selected_line is None:
@@ -129,12 +130,21 @@ def construct_data(code_content:str) -> Tuple[str, str, str]:
     prefix = "".join([raw_lines[i] for i in range(0, selected_index[0])]) if selected_index[0] > 0 else ""
     suffix = "".join([raw_lines[i] for i in range(selected_index[-1] + 1, len(raw_lines))]) if selected_index[-1] < len(raw_lines) else ""
     if random.random() > 0.8:
-        middle = selected_line
+        start = 0
     else:
-        split_point = random.randint(0, len(selected_line) - 2)
-        prefix += selected_line[:split_point]
-        middle = selected_line[split_point:]
-    
+        start = random.randint(0, len(selected_line) - 10)
+    if selected_line.count("\n") > 1 and random.random() > 0.5:
+        newline_indices = [i for i, char in enumerate(selected_line) if char == "\n" and i > start]
+        if len(newline_indices) > 0:
+            end = random.choice(newline_indices) + 1
+        else:
+            end = len(selected_line)
+    else:
+        end = len(selected_line)
+        
+    prefix += selected_line[:start]
+    middle = selected_line[start:end]
+    suffix = selected_line[end:] + suffix
     
     return prefix, suffix, middle
 
@@ -191,7 +201,7 @@ def process_repository(repo_name, tokenizer):
         # BM25检索
         query = tokenizer.tokenize(query_str)
         doc_scores = bm25_model.get_scores(query)
-        sorted_indices = np.argsort(doc_scores)[::-1][:20]
+        sorted_indices = np.argsort(doc_scores)[::-1][:50]
         
         related_codes = [
             code_blocks[idx] for idx in sorted_indices
@@ -267,7 +277,7 @@ if __name__ == "__main__":
     del(repo_dict)
     dataframe = {"task_id":[], "path":[], "left_context":[], "right_context":[], "crossfile_context":[], "groundtruth":[]}
     
-    with multiprocessing.Pool(processes=os.cpu_count()//2) as pool:
+    with multiprocessing.Pool(processes=os.cpu_count()//4) as pool:
         process_fn = partial(process_repository, tokenizer=tokenizer)
         results = list(tqdm(
             pool.imap(process_fn, keys),
@@ -291,4 +301,4 @@ if __name__ == "__main__":
     dataframe = pd.DataFrame.from_dict(dataframe)
     if not os.path.exists("data/github_projects/python"):
         os.makedirs("data/github_projects/python")
-    dataframe.to_json(f"data/github_projects/python/{args.dataset_name}-train_03_23.json")
+    dataframe.to_json(f"data/github_projects/python/{args.dataset_name}-train_4_8.json")

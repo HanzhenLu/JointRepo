@@ -9,6 +9,7 @@ import random
 from pathlib import Path
 from tqdm import tqdm
 from typing import List
+from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader, Dataset, RandomSampler
 from transformers import (AdamW, get_linear_schedule_with_warmup)
 
@@ -55,7 +56,7 @@ def test(benchmark:Benchmarks, names:List[str], generator:Generator, retriever:R
                         document=documents
                     )
                 )
-                
+            
             generations = generator.generate(decoder_features, is_training=False)
         if os.path.exists(f"{args.output_dir}/result_{epoch}/{name}") is False:
             os.makedirs(f"{args.output_dir}/result_{epoch}/{name}", exist_ok=True)
@@ -172,8 +173,8 @@ def main():
     # build model
     generator, retriever = build_model(args)
     testsets_name = [
-        "ours_suffix", 
         "ours", 
+        "ours_suffix", 
         "cceval_python", 
         "repoeval_line"
     ]
@@ -187,8 +188,8 @@ def main():
         data = load_dataset(args.train_filename, tokenizer_name, args.sampled_code_num * 5)
         if args.debug:
             random.shuffle(data)
-            train_data = data[int(len(data)*0.04):int(len(data)*0.08)]
-            valid_data = data[int(len(data)*0.999):]
+            train_data = data[:8000]
+            valid_data = data[-800:]
             benchmark.test_datasets["train"] = train_data[:len(train_data)//10]
         else:
             train_data = data[:int(len(data)*0.9)]
@@ -202,7 +203,7 @@ def main():
             if len(example.relevant_code) <= 1:
                 continue
             train_feature = convert_example_to_feature(example.prefix, example.suffix, example.middle, \
-                example.relevant_code, generator.tokenizer, args)
+                example.relevant_code, generator.tokenizer)
             train_features.append(train_feature)
         
         train_dataset = MyDataset(train_features)
@@ -257,6 +258,8 @@ def main():
                     
                     with torch.no_grad():
                         feature_loss = generator.generate(decoder_features, True)
+                        # target_idx = torch.argmin(feature_loss)
+                        
                         max_loss = torch.max(feature_loss)
                         min_loss = torch.min(feature_loss)
                         feature_loss = (feature_loss - min_loss) / (max_loss - min_loss)
@@ -274,10 +277,10 @@ def main():
                 loss.backward()
                 if len(losses) % args.gradient_accumulation_steps == 0:
                     # Update parameters
-                    # clip_grad_norm_(
-                    #     retriever.model.parameters(),
-                    #     args.max_grad_norm
-                    # )
+                    clip_grad_norm_(
+                        retriever.model.parameters(),
+                        args.max_grad_norm
+                    )
                     
                     optimizer.step()
                     optimizer.zero_grad()
