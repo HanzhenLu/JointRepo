@@ -1,11 +1,12 @@
 import random
-import pandas as pd
 import re
 import os
 import torch
+import pickle
 import numpy as np
+import rank_bm25
+from pathlib import Path
 from tqdm import tqdm
-from fastbm25 import fastbm25
 from typing import List, Dict
 from transformers import PreTrainedTokenizer, AutoTokenizer
 
@@ -29,6 +30,13 @@ class CodeBlock(object):
 
     def __str__(self):
         return f"#{self.file_path}\n{self.code_content}"
+    
+    def __eq__(self, value):
+        assert type(value) == CodeBlock
+        if self.file_path == value.file_path and self.code_content == value.code_content:
+            return True
+        else:
+            return False
         
 class InputFeatures(object):
     """A single training/test features for a example."""
@@ -46,13 +54,13 @@ class InputFeatures(object):
         self.document = document
         
 class Benchmarks(dict):
-    def __init__(self, valid_dataset:List[Example], tokenizer:AutoTokenizer, args):
+    def __init__(self, tokenizer:AutoTokenizer, args):
+        tokenizer_name = Path(args.generator_name_or_path).parts[-1]
         self.test_datasets = {
-            "github_projects": valid_dataset,
-            "ours_suffix": load_dataset("ours_suffix"),
-            "ours": load_dataset("ours"),
-            "cceval_python": load_dataset("cceval_python"),
-            "repoeval_line": load_dataset("repoeval_line")
+            "ours_suffix": load_dataset("ours-suffix", tokenizer_name, args.sampled_code_num*5),
+            "ours": load_dataset("ours", tokenizer_name, args.sampled_code_num*5),
+            "cceval_python": load_dataset("cceval", tokenizer_name, args.sampled_code_num*5),
+            "repoeval_line": load_dataset("repoeval", tokenizer_name, args.sampled_code_num*5)
         }
         self.test_features = {}
         self.tokenizer = tokenizer
@@ -66,7 +74,7 @@ class Benchmarks(dict):
             for example in tqdm(self.test_datasets[key], desc=f"convert {key} into features"):
                 example:Example
                 features.append(convert_example_to_feature(example.prefix, example.suffix, example.middle, \
-                    example.relevant_code, self.tokenizer, self.args))
+                    example.relevant_code, self.tokenizer))
             self.test_features[key] = features
         else:
             features = self.test_features[key]
@@ -80,63 +88,30 @@ def set_seed(seed=42):
     torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
 
-def load_dataset(datasetname:str) -> List[Example]:
+def load_dataset(datasetname:str, tokenizer_name:str, k:int) -> List[Example]:
     """
     Loads a dataset.
     :param datasetname: The name of the dataset to load.
     :return: The loaded dataset.
     """
-    if datasetname == "cceval_python":
-        data_frame = pd.read_parquet("data/cceval/python/test.parquet")
-    elif datasetname == "repoeval_line":
-        data_frame_parts = []
-        data_frame_parts.append(pd.read_parquet("data/repoeval/line_level/test_0.parquet"))
-        data_frame_parts.append(pd.read_parquet("data/repoeval/line_level/test_1.parquet"))
-        data_frame = pd.concat(data_frame_parts)
-    elif datasetname == "github_projects":
-        data_frame = pd.read_json("data/github_projects/python/train.json")
-    elif datasetname == "github_repos":
-        data_frame = pd.read_parquet("data/github_repos/python/train.parquet")
-    elif datasetname == "ours":
-        data_frame = pd.read_parquet("data/ours/python/test.parquet")
-    elif datasetname == "ours_suffix":
-        data_frame = pd.read_parquet("data/ours/python/test_suffix.parquet")
-    else:
-        raise Exception("Unsupport dataset name")
+    file_name = f"{datasetname}-{tokenizer_name}-{k}.pkl"
+    with open(f"preprocessed/{file_name}", 'rb') as f:
+        dataset = pickle.load(f)
+    
+    return dataset
 
-    datasets = []
-    for item in data_frame[["task_id", "path", "left_context", "right_context", "crossfile_context", "groundtruth"]].values:
-        cross_files = item[4]
-        cross_files = [CodeBlock(x["path"], x["text"]) for x in cross_files]
-        if datasetname == "repoeval_line":
-            datasets.append(Example(item[0], item[2]+"\n", item[3], item[5], cross_files))
-        else:
-            datasets.append(Example(item[0], item[2], item[3], item[5], cross_files))
-    
-    return datasets
-
-def convert_example_to_feature(prefix:str, suffix:str, middle:str, related_files:List[CodeBlock], tokenizer:PreTrainedTokenizer, args) -> InputFeatures:
-    
-    code_blocks:List[CodeBlock] = []
-    for file in related_files:
-        code_blocks.extend(split_into_smaller_blocks(file, args.enable_fixed_block))
-    
-    candidate_str = [x.code_content for x in code_blocks]
+def convert_example_to_feature(prefix:str, suffix:str, middle:str, related_codes:List[CodeBlock], tokenizer:PreTrainedTokenizer) -> InputFeatures:
     prefix_line = prefix.split("\n")
-    # TODO: set the query_line as a hyperparameter
-    if len(prefix_line) >= 15:
-        query_str = "\n".join(prefix_line[-15:])
-    else:
-        query_str = "\n".join(prefix_line)
-        suffix_line = suffix.split("\n")
-        query_str += "\n" + "\n".join(suffix_line[:15-len(prefix_line)])
-    
-    candidate_num = args.relevant_code_num * 5
-    result = bm25_retrieve(query_str, candidate_str, tokenizer, k=candidate_num)
-    
-    related_codes = [code_blocks[x[1]] for x in result]
-    for i in range(args.relevant_code_num):
-        related_codes.append(CodeBlock("Unknown", f"# Don't need crossfile {i}"))
+    # 处理前缀部分：最多取8行
+    prefix_part = prefix_line[-8:] if len(prefix_line) >= 8 else prefix_line
+    remaining = 15 - len(prefix_part)  # 计算需要从后缀补充的行数
+
+    # 处理后缀部分：过滤空行并取剩余需要的行数
+    suffix_line_clean = [line for line in suffix.split('\n') if line.strip()]
+    suffix_part = suffix_line_clean[:remaining]
+
+    # 合并结果
+    query_str = "\n".join(prefix_part + suffix_part)
     
     prefix_tokenized_result = tokenizer(prefix, add_special_tokens=False)
     suffix_tokenized_result = tokenizer(suffix, add_special_tokens=False)
@@ -160,7 +135,7 @@ def split_into_smaller_blocks(code_block:CodeBlock, enable_fixed_block:bool) -> 
     # 每15行划分一个block
     if enable_fixed_block:
         lines = [line for line in code_block.code_content.split('\n') if line.strip() != '']
-        for i in range(0, min(len(lines),5000), 15):
+        for i in range(0, min(len(lines),5000), 7):
             start_line_offset = i
             end_line_offset = min(i + 15, len(lines))
             block_content = '\n'.join(lines[start_line_offset:end_line_offset])
@@ -258,14 +233,17 @@ def bm25_retrieve(query_str:str, candidate_str:List[str], tokenizer:PreTrainedTo
     if k == 0 or len(candidate_str) == 0:
         return []
     # TODO: 将检索使用的token数量设置为一个参数
-    tokenized_corpus = [tokenizer.tokenize(doc)[:200] for doc in candidate_str]
-    bm25_model = fastbm25(tokenized_corpus)
-    query = tokenizer.tokenize(query_str)[:200]
-    result = bm25_model.top_k_sentence(query, k=k)
-    return result
+    tokenized_corpus = [tokenizer.tokenize(doc) for doc in candidate_str]
+    bm25_model = rank_bm25.BM25Okapi(tokenized_corpus)
+    query = tokenizer.tokenize(query_str)
+    doc_scores = bm25_model.get_scores(query)
+    return doc_scores
 
 def get_cross_file_context(related_codes:List[CodeBlock], tokenizer:PreTrainedTokenizer, cross_file_budget:int) -> Dict[str, List[int]]:
     filter_codeblocks = []
+    
+    assert len(related_codes) <= 1
+    
     for x in related_codes:
         file_path = x.file_path
         code_content = x.code_content
@@ -275,18 +253,24 @@ def get_cross_file_context(related_codes:List[CodeBlock], tokenizer:PreTrainedTo
         else:
             break
     
-    if len(filter_codeblocks) > 0:
-        related_tokenized_result = tokenizer(filter_codeblocks, add_special_tokens=False)
-    
     repo_content = {
         "input_ids": [],
         "attention_mask": []
     }
-    related_idx = 0
-    while related_idx < len(filter_codeblocks) and len(repo_content["input_ids"]) + len(related_tokenized_result["input_ids"][related_idx]) < cross_file_budget:
-        repo_content["input_ids"].extend(related_tokenized_result["input_ids"][related_idx])
-        repo_content["attention_mask"].extend(related_tokenized_result["attention_mask"][related_idx])
-        related_idx += 1
+    
+    if len(filter_codeblocks) > 0:
+        related_tokenized_result = tokenizer(filter_codeblocks, add_special_tokens=False)
+    else:
+        return repo_content
+    
+    special_tokens = tokenizer.all_special_tokens
+    if "<RETRIEVAL_START>" in special_tokens and "<RETRIEVAL_END>" in special_tokens:
+        repo_content["input_ids"] = [tokenizer.convert_tokens_to_ids("<RETRIEVAL_START>")] + \
+            related_tokenized_result["input_ids"][0][:cross_file_budget - 2] + [tokenizer.convert_tokens_to_ids("<RETRIEVAL_END>")]
+        repo_content["attention_mask"] = [1] + related_tokenized_result["attention_mask"][0][:cross_file_budget - 2] + [1]
+    else:
+        repo_content["input_ids"] = related_tokenized_result["input_ids"][0][:cross_file_budget]
+        repo_content["attention_mask"] = related_tokenized_result["attention_mask"][0][:cross_file_budget]
     
     return repo_content
 

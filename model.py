@@ -3,10 +3,9 @@
 import numpy as np
 import logging
 import torch
-import itertools
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel
-from typing import Tuple, List, Union, Dict
+from typing import Tuple, List, Union
 
 from utils.util import (get_cross_file_context,
                         CodeBlock, InputFeatures)
@@ -20,7 +19,6 @@ class Retriever:
             self.model = AutoModel.from_pretrained(model_name_or_path, add_pooling_layer=False, trust_remote_code=True)
         else:
             self.model = AutoModel.from_pretrained(model_name_or_path, trust_remote_code=True)
-        self.tau = 1.0
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     def embedding(self, input_str:Union[str, List[str]], is_query:bool) -> torch.Tensor:
@@ -33,53 +31,43 @@ class Retriever:
         embedding = torch.nn.functional.normalize(embedding, p=2, dim=1)
         return embedding
     
-    def retrieve(self, query_str:str, documents:List[CodeBlock], k:int, n:int, is_training:bool=True) \
-        -> Union[Tuple[torch.Tensor, Dict], List[str]]:
+    def retrieve(self, query_str:str, documents:List[CodeBlock], n:int=None, is_training:bool=True) \
+        -> Union[torch.Tensor, List[CodeBlock]]:
         r'''
-        返回候选文档每种排列被采样到的次数，以及被采样到的排列下标与检索内容之间的映射
         Params:
             query_str:用于检索的字符串
             document_str:被检索的文档合集
-            k:采样次数
-            n:检索返回的最大文档数量
+            is_training:训练时返回各个document的分数；非训练时返回分数最高的n个document
         '''
-        # 提供的文档数可能小于需要的文档数
-        n = min(n, len(documents))
-        # 如果只有一个候选项的话采样一次就够了
-        if len(documents) == 1:
-            k = 1
-        
-        query_embedding = self.embedding(query_str, True)
-        document_embedding = self.embedding([doc.code_content for doc in documents], False)
-        scores = torch.matmul(query_embedding, document_embedding.T).squeeze(dim=0)
-        
-        permutations = list(itertools.permutations(range(len(documents)), n))
-        perm_tensor = torch.tensor(permutations)
-        
-        position_weights = torch.tensor([1/(i+1) for i in range(n)]).to(scores.device)
-        
-        selected_scores = scores[perm_tensor]
-        # 因为这里已经将所有被检索目标的分数都添加到一起了，
-        # 所以后面一定要使用到，不然就会发生偏差
-        # 一个更好的方法是允许不检索任何内容
-        permutation_scores = (selected_scores * position_weights).sum(dim=1)
         
         if not is_training:
-            permutation_id = torch.argmax(permutation_scores, dim=-1).cpu()
-            doc_ids = permutations[permutation_id]
-            return [documents[i] for i in doc_ids]
+            assert n is not None
+            
+            if len(documents) == 0:
+                return []
+            
+            # 提供的文档数可能小于需要的文档数
+            n = min(n, len(documents))
+            
+            self.eval()
+            with torch.no_grad():
+                query_embedding = self.embedding(query_str, True)
+                document_embedding = self.embedding([doc.code_content for doc in documents], False)
+                scores = torch.matmul(query_embedding, document_embedding.T).squeeze(dim=0)
+            self.train()
+            
+            _, top_indices = torch.topk(scores, n)
+            top_indices = top_indices.cpu().tolist()
+            return [documents[i] for i in top_indices]
         
-        samples = {}
-        sum = torch.zeros_like(permutation_scores)
-        for _ in range(k):
-            soft_samples = torch.nn.functional.gumbel_softmax(permutation_scores, self.tau, hard=True, dim=-1)
-            permutation_id = torch.argmax(soft_samples, dim=-1).cpu()
-            doc_ids = permutations[permutation_id]
-            if permutation_id not in samples:
-                samples[permutation_id.item()] = [documents[i] for i in doc_ids]
-            sum += soft_samples
+        else:
+            assert len(documents) != 0
+            
+            query_embedding = self.embedding(query_str, True)
+            document_embedding = self.embedding([doc.code_content for doc in documents], False)
+            scores = torch.matmul(query_embedding, document_embedding.T).squeeze(dim=0)
         
-        return sum, samples
+            return scores
     
     def eval(self):
         self.model.eval()
@@ -119,19 +107,6 @@ class UnixcoderForRetriever(Retriever):
         sentence_embeddings = (token_embeddings * mask.unsqueeze(-1)).sum(1) / mask.sum(-1).unsqueeze(-1)
         sentence_embeddings = torch.nn.functional.normalize(sentence_embeddings, p=2, dim=1)
         return sentence_embeddings
-
-class JinaForRetriever(Retriever):
-    def __init__(self, model_name_or_path:str):
-        self.model = AutoModel.from_pretrained(model_name_or_path, trust_remote_code=True)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-    def embedding(self, input_str, is_query):
-        sentence_embeddings = self.model.encode(input_str)
-        sentence_embeddings = torch.tensor(sentence_embeddings)
-        if isinstance(input_str, str):
-            sentence_embeddings = sentence_embeddings.unsqueeze(0)
-        sentence_embeddings = torch.nn.functional.normalize(sentence_embeddings, p=2, dim=1)
-        return sentence_embeddings
     
 class Generator:
     def __init__(self, model_name_or_path:str, args):
@@ -139,11 +114,22 @@ class Generator:
         self.model = AutoModelForCausalLM.from_pretrained(model_name_or_path)
         # 特殊标记ID映射
         # TODO: 这需要根据模型进行改动
-        self.special_token_ids = {
-            "prefix_id": self.tokenizer.convert_tokens_to_ids("<PREFIX>"),
-            "suffix_id": self.tokenizer.convert_tokens_to_ids("<SUFFIX>"),
-            "middle_id": self.tokenizer.convert_tokens_to_ids("<MIDDLE>")
-        }
+        if "opc" in model_name_or_path or "llama" in model_name_or_path:
+            self.special_token_ids = {
+                "prefix_id": self.tokenizer.convert_tokens_to_ids("<PREFIX>"),
+                "suffix_id": self.tokenizer.convert_tokens_to_ids("<SUFFIX>"),
+                "middle_id": self.tokenizer.convert_tokens_to_ids("<MIDDLE>"),
+                "eos_id": self.tokenizer.convert_tokens_to_ids("<EOS>")
+            }
+        elif "deepseek" in model_name_or_path:
+            self.special_token_ids = {
+                "prefix_id": self.tokenizer.convert_tokens_to_ids("<｜fim▁begin｜>"),
+                "suffix_id": self.tokenizer.convert_tokens_to_ids("<｜fim▁end｜>"),
+                "middle_id": self.tokenizer.convert_tokens_to_ids("<｜fim▁hole｜>"),
+                "eos_id": self.tokenizer.eos_token_id
+            }
+        else:
+            raise RuntimeError("Unknown generator")
         self.args = args
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -155,11 +141,13 @@ class Generator:
             # 处理跨文件上下文
             cross_file_context = get_cross_file_context(feature.document, self.tokenizer, self.args.max_crossfile_length)
             
+            middle_ids = feature.middle_ids[:self.args.max_generation_length]
+            
             # 计算分配长度
             if is_training:
-                max_allocated_length = self.args.max_input_length - len(cross_file_context["input_ids"]) - len(feature.middle_ids) - 4
+                max_allocated_length = self.args.max_input_length - len(cross_file_context["input_ids"]) - len(middle_ids) - 5
             else:
-                max_allocated_length = self.args.max_input_length - len(cross_file_context["input_ids"]) - 3
+                max_allocated_length = self.args.max_input_length - len(cross_file_context["input_ids"]) - 4
             prefix_length = max_allocated_length // 2
             suffix_length = max_allocated_length - prefix_length
             if len(feature.prefix_ids) < prefix_length and len(feature.suffix_ids) < suffix_length:
@@ -177,13 +165,20 @@ class Generator:
                 prefix_ids = feature.prefix_ids[-prefix_length:]
                 suffix_ids = feature.suffix_ids[:suffix_length]
             
-            if is_training:    
-                input_ids = [self.special_token_ids["suffix_id"]] + suffix_ids + [self.special_token_ids["prefix_id"]] \
-                    + cross_file_context["input_ids"] + prefix_ids + [self.special_token_ids["middle_id"]] + \
-                        feature.middle_ids + [self.tokenizer.eos_token_id]
+            if is_training:
+                if "opc" in self.args.generator_name_or_path or "llama" in self.args.generator_name_or_path:
+                    input_ids = [self.special_token_ids["suffix_id"]] + suffix_ids + [self.special_token_ids["prefix_id"]] \
+                        + cross_file_context["input_ids"] + prefix_ids + [self.special_token_ids["middle_id"]] + \
+                            middle_ids + [self.special_token_ids["eos_id"]]
+                    
+                elif "deepseek" in self.args.generator_name_or_path:
+                    input_ids = [32013] + [self.special_token_ids["prefix_id"]] + cross_file_context["input_ids"] \
+                        + prefix_ids + [self.special_token_ids["middle_id"]] + suffix_ids + [self.special_token_ids["suffix_id"]] \
+                        + middle_ids + [self.special_token_ids["eos_id"]]
+                
+                labels = [-100] * (len(input_ids) - len(middle_ids) - 1) \
+                    + middle_ids + [self.special_token_ids["eos_id"]]
                 attention_mask = [1] * len(input_ids)
-                labels = [-100] * (len(input_ids) - len(feature.middle_ids) - 1) \
-                    + feature.middle_ids + [self.tokenizer.eos_token_id]
                 padding_length = self.args.max_input_length - len(input_ids)
                 input_ids += [self.tokenizer.pad_token_id] * padding_length
                 attention_mask += [0] * padding_length
@@ -193,8 +188,12 @@ class Generator:
                 batch_attention_mask.append(attention_mask)
                 batch_labels.append(labels)
             else:
-                input_ids = [self.special_token_ids["suffix_id"]] + suffix_ids + [self.special_token_ids["prefix_id"]] \
-                    + cross_file_context["input_ids"] + prefix_ids + [self.special_token_ids["middle_id"]]
+                if "opc" in self.args.generator_name_or_path or "llama" in self.args.generator_name_or_path:
+                    input_ids = [self.special_token_ids["suffix_id"]] + suffix_ids + [self.special_token_ids["prefix_id"]] \
+                        + cross_file_context["input_ids"] + prefix_ids + [self.special_token_ids["middle_id"]]
+                elif "deepseek" in self.args.generator_name_or_path:
+                    input_ids = [32013] + [self.special_token_ids["prefix_id"]] + cross_file_context["input_ids"] \
+                        + prefix_ids + [self.special_token_ids["middle_id"]] + suffix_ids + [self.special_token_ids["suffix_id"]]
                 attention_mask = [1] * len(input_ids)
                 padding_length = self.args.max_input_length - len(input_ids)
                 input_ids = [self.tokenizer.pad_token_id] * padding_length + input_ids
@@ -202,7 +201,7 @@ class Generator:
                 assert len(input_ids) == len(attention_mask)
                 batch_input_ids.append(input_ids)
                 batch_attention_mask.append(attention_mask)
-        
+            
         input_tensor = torch.tensor(batch_input_ids, dtype=torch.long).to(self.device)
         attention_tensor = torch.tensor(batch_attention_mask, dtype=torch.bool).to(self.device)
         if is_training:
@@ -212,14 +211,28 @@ class Generator:
                                 labels=label_tensor)
             
             batch_logits = outputs.logits
-            loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
-
+            loss_fct = torch.nn.CrossEntropyLoss(reduction='none', ignore_index=-100)
+            
+            shift_logits = batch_logits[..., :-1, :].contiguous()
+            shift_labels = label_tensor[..., 1:].contiguous()
+            
             per_position_loss = loss_fct(
-                batch_logits.view(-1, batch_logits.size(-1)),
-                label_tensor.view(-1)
-            ).view(batch_logits.size(0), batch_logits.size(1))
+                shift_logits.view(-1, batch_logits.size(-1)),
+                shift_labels.view(-1)
+            ).view(batch_logits.size(0), -1)
 
-            per_sample_loss = per_position_loss.mean(dim=1)
+            # 创建掩码，标记有效标签位置（不等于-100）
+            mask = (shift_labels != -100)
+            
+            # 计算每个样本的总损失（忽略的位置损失已为0）
+            per_sample_loss_sum = per_position_loss.sum(dim=1)
+            
+            # 计算每个样本的有效标签数量，并将0替换为1避免除以0
+            valid_counts = mask.sum(dim=1).float()
+            valid_counts[valid_counts == 0] = 1.0
+            
+            # 计算每个样本的平均损失
+            per_sample_loss = per_sample_loss_sum / valid_counts
             return per_sample_loss
             
         else:
@@ -251,16 +264,17 @@ def get_model_size(model):
 
 def build_model(args) -> Tuple[Generator, Retriever]:
     generator = Generator(args.generator_name_or_path, args)
-    if "unixocder" in args.retriever_name_or_path.lower():
+    if args.retriever_name_or_path is None:
+        retriever = None
+    elif "unixocder" in args.retriever_name_or_path.lower():
         logger.info("Using child class UnixcoderForRetriever !!!")
         retriever = UnixcoderForRetriever(args.retriever_name_or_path)
-    elif "jina" in args.retriever_name_or_path.lower():
-        logger.info("Using child class JinaForRetriever !!!")
-        retriever = JinaForRetriever(args.retriever_name_or_path)
-    elif args.retriever_name_or_path is None:
-        retriever = None
     else:
         retriever = Retriever(args.retriever_name_or_path)
+        
+    if args.weighted_parameters is not None:
+        logger.info(f"load parameters from {args.weighted_parameters}")
+        retriever.model.load_state_dict(torch.load(args.weighted_parameters))
     
     generator.model.to(args.device)  
     logger.info("Finish loading generator [%s] from %s", get_model_size(generator.model), args.generator_name_or_path)
