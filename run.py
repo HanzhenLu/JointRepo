@@ -53,6 +53,7 @@ def test(benchmark:Benchmarks, names:List[str], generator:Generator, retriever:R
                         feature.prefix_ids,
                         feature.suffix_ids,
                         feature.middle_ids,
+                        feature.project_name_ids,
                         document=documents
                     )
                 )
@@ -178,9 +179,14 @@ def main():
         "cceval_python", 
         "repoeval_line"
     ]
-    
-    tokenizer_name = Path(args.generator_name_or_path).parts[-1]
-    benchmark = Benchmarks(generator.tokenizer, args)
+    tokenizer_name = Path(args.retriever_name_or_path).parts[-1]
+    test_dataset = {
+        "ours_suffix": load_dataset("ours-suffix", tokenizer_name, args.sampled_code_num*5),
+        "ours": load_dataset("ours", tokenizer_name, args.sampled_code_num*5),
+        "cceval_python": load_dataset("cceval", tokenizer_name, args.sampled_code_num*5),
+        "repoeval_line": load_dataset("repoeval", tokenizer_name, args.sampled_code_num*5)
+    }
+    benchmark = Benchmarks(test_dataset, generator.tokenizer, args)
     
     logger.info("Training/evaluation parameters %s", args)
     
@@ -260,9 +266,9 @@ def main():
                         feature_loss = generator.generate(decoder_features, True)
                         # target_idx = torch.argmin(feature_loss)
                         
-                        max_loss = torch.max(feature_loss)
-                        min_loss = torch.min(feature_loss)
-                        feature_loss = (feature_loss - min_loss) / (max_loss - min_loss)
+                        # max_loss = torch.max(feature_loss)
+                        # min_loss = torch.min(feature_loss)
+                        # feature_loss = (feature_loss - min_loss) / (max_loss - min_loss)
                         # mean = torch.mean(feature_loss)
                         # std = torch.std(feature_loss)
                         # feature_loss = (feature_loss - mean) / std

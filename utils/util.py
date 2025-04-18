@@ -44,24 +44,21 @@ class InputFeatures(object):
                  prefix_ids:List[int],
                  suffix_ids:List[int],
                  middle_ids:List[int] = None,
+                 project_name_ids:List[int] = None,
                  query:str = None,
                  document:List[CodeBlock] = None,
     ):
         self.prefix_ids = prefix_ids
         self.middle_ids = middle_ids
         self.suffix_ids = suffix_ids
+        self.project_name_ids = project_name_ids
         self.query = query
         self.document = document
         
 class Benchmarks(dict):
-    def __init__(self, tokenizer:AutoTokenizer, args):
+    def __init__(self, test_datasets, tokenizer:AutoTokenizer, args):
         tokenizer_name = Path(args.generator_name_or_path).parts[-1]
-        self.test_datasets = {
-            "ours_suffix": load_dataset("ours-suffix", tokenizer_name, args.sampled_code_num*5),
-            "ours": load_dataset("ours", tokenizer_name, args.sampled_code_num*5),
-            "cceval_python": load_dataset("cceval", tokenizer_name, args.sampled_code_num*5),
-            "repoeval_line": load_dataset("repoeval", tokenizer_name, args.sampled_code_num*5)
-        }
+        self.test_datasets = test_datasets
         self.test_features = {}
         self.tokenizer = tokenizer
         self.args = args
@@ -74,7 +71,7 @@ class Benchmarks(dict):
             for example in tqdm(self.test_datasets[key], desc=f"convert {key} into features"):
                 example:Example
                 features.append(convert_example_to_feature(example.prefix, example.suffix, example.middle, \
-                    example.relevant_code, self.tokenizer))
+                    example.relevant_code, self.tokenizer, example.task_id))
             self.test_features[key] = features
         else:
             features = self.test_features[key]
@@ -100,7 +97,8 @@ def load_dataset(datasetname:str, tokenizer_name:str, k:int) -> List[Example]:
     
     return dataset
 
-def convert_example_to_feature(prefix:str, suffix:str, middle:str, related_codes:List[CodeBlock], tokenizer:PreTrainedTokenizer) -> InputFeatures:
+def convert_example_to_feature(prefix:str, suffix:str, middle:str, related_codes:List[CodeBlock], tokenizer:PreTrainedTokenizer, task_ids:str=None) -> InputFeatures:
+    
     prefix_line = prefix.split("\n")
     # 处理前缀部分：最多取8行
     prefix_part = prefix_line[-8:] if len(prefix_line) >= 8 else prefix_line
@@ -116,11 +114,20 @@ def convert_example_to_feature(prefix:str, suffix:str, middle:str, related_codes
     prefix_tokenized_result = tokenizer(prefix, add_special_tokens=False)
     suffix_tokenized_result = tokenizer(suffix, add_special_tokens=False)
     middle_tokenized_result = tokenizer(middle, add_special_tokens=False)
+    
+    if task_ids is not None:
+        project_name = task_ids.split("/")[0]
+        project_name_result = tokenizer(project_name, add_special_tokens=False)
+    else:
+        project_name_result = {
+            "input_ids": None
+        }
 
     feature = InputFeatures(
         prefix_tokenized_result["input_ids"],
         suffix_tokenized_result["input_ids"],
         middle_tokenized_result["input_ids"],
+        project_name_result["input_ids"],
         query_str,
         related_codes
     )

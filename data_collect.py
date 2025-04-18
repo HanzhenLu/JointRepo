@@ -10,6 +10,8 @@ import multiprocessing
 import json
 import rank_bm25
 import numpy as np
+import shutil
+from functools import partial
 from pathlib import Path
 from collections import defaultdict
 from typing import Dict, List, Tuple
@@ -26,7 +28,7 @@ ALLOWED = set(
     ' ' + '\n' + '\t'         # 空格、换行符、制表符
 )
 
-TEMP_DIR =  "intermediate/data_collect"
+TEMP_DIR =  "/data/hanzhenlu/temp/intermediate/"
 
 def label_line(code:str) -> List[Tuple[List[int], bool]]:
     stack = []
@@ -99,7 +101,7 @@ def read_dir(dir:str) -> Dict[str, str]:
     return content_map
 
 def construct_data(code_content:str) -> Tuple[str, str, str]:
-    if not check_character_percentage(code_content):
+    if len(code_content.splitlines()) < 15 or not check_character_percentage(code_content):
         return None
     
     try:
@@ -148,7 +150,29 @@ def construct_data(code_content:str) -> Tuple[str, str, str]:
     
     return prefix, suffix, middle
 
-def process_repository(repo_name, tokenizer):
+def construct_data_repo(code_content:str) -> Tuple[str, str, str]:
+    if len(code_content.splitlines()) < 15 or not check_character_percentage(code_content):
+        return None
+    
+    try:
+        ast.parse(code_content)
+    except Exception:
+        return None
+    
+    raw_lines = code_content.splitlines(keepends=True)
+    valid_line_index = [i for i, line in enumerate(raw_lines) if len(line.strip()) > 15]
+    if len(valid_line_index) == 0:
+        return None
+    selected_index = random.choice(valid_line_index)
+    
+    prefix = "".join(raw_lines[:selected_index])
+    middle = raw_lines[selected_index].rstrip() + "\n"
+    suffix = "".join(raw_lines[selected_index+1:])
+    
+    return prefix, suffix, middle
+    
+
+def process_repository(repo_name, tokenizer, construct_data_fn):
     """处理单个仓库的独立函数"""
     with open(os.path.join(TEMP_DIR, repo_name), 'r') as f:
         file_content_map = json.loads(f.read())
@@ -174,7 +198,7 @@ def process_repository(repo_name, tokenizer):
     # 打乱顺序，确保生成的数据多样性
     random.shuffle(file_names)
     for file_name in file_names:
-        result = construct_data(file_content_map[file_name])
+        result = construct_data_fn(file_content_map[file_name])
         if not result:
             continue
             
@@ -224,6 +248,8 @@ if __name__ == "__main__":
     
     parser.add_argument("--dataset_name", default="self-collected", type=str)
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--workers", default=1, type=int)
+    parser.add_argument("--repocoder", action="store_true")
     
     tokenizer = AutoTokenizer.from_pretrained("/data/hanzhenlu/LLaMA-Factory/saves/llama_100m_SPM_pretrained_sft_v4")
     
@@ -236,10 +262,7 @@ if __name__ == "__main__":
         for repo_name in repo_names:
             repo_dict[repo_name] = read_dir(os.path.join(root, repo_name))
     elif args.dataset_name == "huawei":
-        if args.debug:
-            raw_data = pd.read_csv("/nasdata/datasets/huawei_datasets/python_dataset.csv", nrows=3000)
-        else:
-            raw_data = pd.read_csv("/nasdata/datasets/huawei_datasets/python_dataset.csv")
+        raw_data = pd.read_csv("/nasdata/datasets/huawei_datasets/python_dataset.csv")
         repo_dict = defaultdict(dict)
         base_path = "/data/jiaweilu/repos/"
         for full_path, code_content in zip(raw_data["Path"], raw_data["Code"]):
@@ -273,12 +296,19 @@ if __name__ == "__main__":
             value_str = json.dumps(value)
             f.write(value_str)
     
-    keys = repo_dict.keys()
+    keys = list(repo_dict.keys())
     del(repo_dict)
+    if args.debug:
+        random.shuffle(keys)
+        keys = keys[:len(keys) // 20]
     dataframe = {"task_id":[], "path":[], "left_context":[], "right_context":[], "crossfile_context":[], "groundtruth":[]}
     
-    with multiprocessing.Pool(processes=os.cpu_count()//4) as pool:
-        process_fn = partial(process_repository, tokenizer=tokenizer)
+    if args.repocoder:
+        process_fn = partial(process_repository, tokenizer=tokenizer, construct_data_fn=construct_data_repo)
+    else:
+        process_fn = partial(process_repository, tokenizer=tokenizer, construct_data_fn=construct_data)
+    
+    with multiprocessing.Pool(processes=args.workers) as pool:
         results = list(tqdm(
             pool.imap(process_fn, keys),
             total=len(keys),
@@ -301,4 +331,9 @@ if __name__ == "__main__":
     dataframe = pd.DataFrame.from_dict(dataframe)
     if not os.path.exists("data/github_projects/python"):
         os.makedirs("data/github_projects/python")
-    dataframe.to_json(f"data/github_projects/python/{args.dataset_name}-train_4_8.json")
+    if args.repocoder:
+        dataframe.to_json(f"data/github_projects/python/{args.dataset_name}-repocoder_4_15.json")
+    else:
+        dataframe.to_json(f"data/github_projects/python/{args.dataset_name}-train_4_18.json")
+    
+    shutil.rmtree(TEMP_DIR)

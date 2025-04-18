@@ -128,6 +128,14 @@ class Generator:
                 "middle_id": self.tokenizer.convert_tokens_to_ids("<｜fim▁hole｜>"),
                 "eos_id": self.tokenizer.eos_token_id
             }
+        elif "Qwen" in model_name_or_path:
+            self.special_token_ids = {
+                "prefix_id": self.tokenizer.convert_tokens_to_ids("<|fim_prefix|>"),
+                "suffix_id": self.tokenizer.convert_tokens_to_ids("<|fim_suffix|>"),
+                "middle_id": self.tokenizer.convert_tokens_to_ids("<|fim_middle|>"),
+                "repo_name_id": self.tokenizer.convert_tokens_to_ids("<|repo_name|>"),
+                "file_sep_id": self.tokenizer.convert_tokens_to_ids("<|file_sep|>")
+            }
         else:
             raise RuntimeError("Unknown generator")
         self.args = args
@@ -148,6 +156,10 @@ class Generator:
                 max_allocated_length = self.args.max_input_length - len(cross_file_context["input_ids"]) - len(middle_ids) - 5
             else:
                 max_allocated_length = self.args.max_input_length - len(cross_file_context["input_ids"]) - 4
+                
+            if "Qwen" in self.args.generator_name_or_path:
+                max_allocated_length = self.args.max_input_length - len(cross_file_context["input_ids"]) - 5 - len(feature.project_name_ids)
+            
             prefix_length = max_allocated_length // 2
             suffix_length = max_allocated_length - prefix_length
             if len(feature.prefix_ids) < prefix_length and len(feature.suffix_ids) < suffix_length:
@@ -194,6 +206,11 @@ class Generator:
                 elif "deepseek" in self.args.generator_name_or_path:
                     input_ids = [32013] + [self.special_token_ids["prefix_id"]] + cross_file_context["input_ids"] \
                         + prefix_ids + [self.special_token_ids["middle_id"]] + suffix_ids + [self.special_token_ids["suffix_id"]]
+                elif "Qwen" in self.args.generator_name_or_path:
+                    input_ids = [self.special_token_ids["prefix_id"]] + cross_file_context["input_ids"] + \
+                        prefix_ids + [self.special_token_ids["suffix_id"]] + \
+                        suffix_ids + [self.special_token_ids["middle_id"]]
+
                 attention_mask = [1] * len(input_ids)
                 padding_length = self.args.max_input_length - len(input_ids)
                 input_ids = [self.tokenizer.pad_token_id] * padding_length + input_ids
@@ -246,7 +263,7 @@ class Generator:
                 else:
                     model_to_generate = self.model
                 generated_ids = model_to_generate.generate(input_ids, attention_mask=attention_mask, 
-                    max_length=input_ids.size(1)+self.args.max_generation_length, pad_token_id=self.tokenizer.pad_token_id)
+                    max_new_tokens=self.args.max_generation_length, pad_token_id=self.tokenizer.pad_token_id)
                 batch_generated_ids.extend(generated_ids[:, input_ids.size(1):])
             return [self.tokenizer.decode(generated_id, skip_special_tokens=True) for generated_id in batch_generated_ids]
         
