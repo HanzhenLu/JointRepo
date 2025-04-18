@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader, Dataset, RandomSampler
 from torch.optim import AdamW
 from transformers import (get_linear_schedule_with_warmup, 
                           PreTrainedTokenizer, PreTrainedModel)
-from utils.util import (load_dataset, cross_file_contexts, 
+from utils.util import (load_dataset, cross_file_contexts, load_dataset_from_path,
                         CodeBlock, Example, InputFeatures)
 from pathlib import Path
 from model import (build_model, generate)
@@ -39,7 +39,7 @@ def convert_example_to_feature(prefix:str, suffix:str, middle:str, related_codes
     eos_id = tokenizer.convert_tokens_to_ids("<EOS>")
     
     # TODO: set the cross_file_budget as a hyperparameter
-    repo_content = cross_file_contexts(related_codes, tokenizer, int(args.max_input_length * 0.75))
+    repo_content = cross_file_contexts(related_codes[:args.relevant_code_num], tokenizer, int(args.max_input_length * 0.75))
     
     prefix_tokenized_result = tokenizer(prefix, add_special_tokens=False)
     suffix_tokenized_result = tokenizer(suffix, add_special_tokens=False)
@@ -207,10 +207,10 @@ def main():
     tokenizer_name = Path(args.model_name_or_path).parts[-1]
     
     all_eval_examples = {
-        "ours": load_dataset("ours", tokenizer_name, args.relevant_code_num),
-        "ours_suffix": load_dataset("ours-suffix", tokenizer_name, args.relevant_code_num),
-        "cceval_python": load_dataset("cceval", tokenizer_name, args.relevant_code_num),
-        "repoeval_line": load_dataset("repoeval", tokenizer_name, args.relevant_code_num)
+        "ours": load_dataset_from_path("preprocessed/ours-5.pkl"),
+        "ours_suffix": load_dataset_from_path("preprocessed/ours-suffix-5.pkl"),
+        "cceval_python": load_dataset_from_path("preprocessed/cceval-5.pkl"),
+        "repoeval_line": load_dataset_from_path("preprocessed/repoeval-5.pkl")
     }
     
     with open(f"{args.output_dir}/retrieval.pkl", 'wb') as f:

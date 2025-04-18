@@ -90,13 +90,13 @@ def main():
     parser.add_argument('--GPU_ids', type=str, default='0',
                         help="The ids of GPUs will be used")
     
-    parser.add_argument('--enable_fixed_block', action='store_true',
-                        help="Split code into blocks by fixed line")
+    # parser.add_argument('--enable_fixed_block', action='store_true',
+    #                     help="Split code into blocks by fixed line")
     parser.add_argument('--relevant_code_num', default=5, type=int,
                         help="Total number of relevant code blocks to use")
     parser.add_argument('--max_input_length', default=2048, type=int,
                         help="Max token num for input feature")
-    parser.add_argument('--max_generation_length', default=50, type=int,
+    parser.add_argument('--max_generation_length', default=64, type=int,
                         help="Max token num for generating when evaluate")
     
     # print arguments
@@ -147,16 +147,17 @@ def main():
     generator.to(args.device)
     
     eval_examples_sorted = []
-    for i in range(args.relevant_code_num + 1):
+    for i in range(args.relevant_code_num):
         current_eval_examples:Dict[str, List[Example]] = {}
         for key, value in all_eval_examples.items():
             current_list:List[Example] = []
             for example in value:
-                current_list.append(Example(example.task_id, example.prefix, 
+                if len(example.relevant_code) > i:
+                    current_list.append(Example(example.task_id, example.prefix, 
                                                           example.suffix, example.middle, 
-                                                          [example.relevant_code[i]] if len(example.relevant_code) > i 
-                                                          else [CodeBlock("", "")]))
-            current_eval_examples[key] = current_list
+                                                          [example.relevant_code[i]]))
+            if current_list != []:
+                current_eval_examples[key] = current_list
         eval_examples_sorted.append(current_eval_examples)
     
     for i, eval_examples in enumerate(eval_examples_sorted):

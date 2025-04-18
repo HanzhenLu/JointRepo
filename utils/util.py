@@ -51,6 +51,12 @@ def load_dataset(datasetname:str, tokenizer_name:str, k:int) -> List[Example]:
         dataset = pickle.load(f)
     
     return dataset
+
+def load_dataset_from_path(path:str) -> List[Example]:
+    with open(path, 'rb') as f:
+        dataset = pickle.load(f)
+    
+    return dataset
     
 def label_line(code:str) -> List[Tuple[List[int], bool]]:
     stack = []
@@ -211,7 +217,13 @@ def cross_file_contexts(related_codes:List[CodeBlock], tokenizer:PreTrainedToken
     else:
         return repo_content
     
-    repo_content["input_ids"] = related_tokenized_result["input_ids"][0][:cross_file_budget]
-    repo_content["attention_mask"] = related_tokenized_result["attention_mask"][0][:cross_file_budget]
+    special_tokens = tokenizer.all_special_tokens
+    if "<RETRIEVAL_START>" in special_tokens and "<RETRIEVAL_END>" in special_tokens:
+        repo_content["input_ids"] = [tokenizer.convert_tokens_to_ids("<RETRIEVAL_START>")] + \
+            related_tokenized_result["input_ids"][0][:cross_file_budget - 2] + [tokenizer.convert_tokens_to_ids("<RETRIEVAL_END>")]
+        repo_content["attention_mask"] = [1] + related_tokenized_result["attention_mask"][0][:cross_file_budget - 2] + [1]
+    else:
+        repo_content["input_ids"] = related_tokenized_result["input_ids"][0][:cross_file_budget]
+        repo_content["attention_mask"] = related_tokenized_result["attention_mask"][0][:cross_file_budget]
     
     return repo_content

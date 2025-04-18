@@ -49,7 +49,7 @@ class CustomDataset(Dataset):
         self.args = args
         self.tokenizer = tokenizer
         self.examples = examples
-        if "opc" in args.model_name_or_path or "llama" in args.model_name_or_path:
+        if "opc" in args.model_name_or_path or "llama" in args.model_name_or_path or "pretrain" in args.model_name_or_path:
             self.special_token_ids = {
                 "prefix_id": self.tokenizer.convert_tokens_to_ids("<PREFIX>"),
                 "suffix_id": self.tokenizer.convert_tokens_to_ids("<SUFFIX>"),
@@ -107,7 +107,7 @@ class CustomDataset(Dataset):
             prefix_ids = prefix_tokenized_result["input_ids"][-prefix_length:]
             suffix_ids = suffix_tokenized_result["input_ids"][:suffix_length]
         
-        if "opc" in self.args.model_name_or_path or "llama" in self.args.model_name_or_path:
+        if "opc" in self.args.model_name_or_path or "llama" in self.args.model_name_or_path or "pretrain" in self.args.model_name_or_path:
             input_ids = [self.special_token_ids["suffix_id"]] + suffix_ids + [self.special_token_ids["prefix_id"]] \
                 + repo_content["input_ids"] + prefix_ids + [self.special_token_ids["middle_id"]]
         elif "deepseek" in self.args.model_name_or_path:
