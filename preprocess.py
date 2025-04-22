@@ -8,7 +8,7 @@ import pandas as pd
 import numpy as np
 import pickle
 import os
-from multiprocessing import Pool, cpu_count
+from multiprocessing import Pool
 
 # Global variables for multiprocessing
 global_tokenizer = None
@@ -74,7 +74,10 @@ def main():
     datasets = []
     for path in dataset_paths:
         if path.endswith(".json"):
-            datasets.append(pd.read_json(path))
+            try:
+                datasets.append(pd.read_json(path))
+            except ValueError as e:
+                datasets.append(pd.read_json(path, lines=True))
         elif path.endswith(".parquet"):
             datasets.append(pd.read_parquet(path))
         else:

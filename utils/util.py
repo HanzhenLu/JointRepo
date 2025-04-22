@@ -55,12 +55,11 @@ class InputFeatures(object):
         
 class Benchmarks(dict):
     def __init__(self, tokenizer:AutoTokenizer, args):
-        tokenizer_name = Path(args.generator_name_or_path).parts[-1]
         self.test_datasets = {
-            "ours_suffix": load_dataset("ours-suffix", tokenizer_name, args.sampled_code_num*5),
-            "ours": load_dataset("ours", tokenizer_name, args.sampled_code_num*5),
-            "cceval_python": load_dataset("cceval", tokenizer_name, args.sampled_code_num*5),
-            "repoeval_line": load_dataset("repoeval", tokenizer_name, args.sampled_code_num*5)
+            "ours_suffix": load_dataset("ours-suffix", args.sampled_code_num*5),
+            "ours": load_dataset("ours", args.sampled_code_num*5),
+            "cceval_python": load_dataset("cceval", args.sampled_code_num*5),
+            "repoeval_line": load_dataset("repoeval", args.sampled_code_num*5)
         }
         self.test_features = {}
         self.tokenizer = tokenizer
@@ -88,13 +87,13 @@ def set_seed(seed=42):
     torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
 
-def load_dataset(datasetname:str, tokenizer_name:str, k:int) -> List[Example]:
+def load_dataset(datasetname:str, k:int) -> List[Example]:
     """
     Loads a dataset.
     :param datasetname: The name of the dataset to load.
     :return: The loaded dataset.
     """
-    file_name = f"{datasetname}-{tokenizer_name}-{k}.pkl"
+    file_name = f"{datasetname}-{k}.pkl"
     with open(f"preprocessed/{file_name}", 'rb') as f:
         dataset = pickle.load(f)
     

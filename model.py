@@ -79,7 +79,6 @@ class UnixcoderForRetriever(Retriever):
     def __init__(self, model_name_or_path:str):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
         self.model = AutoModel.from_pretrained(model_name_or_path)
-        self.model = torch.nn.DataParallel(self.model).cuda()
         
     def tokenize(self, input_str, is_query):
         tokens = self.tokenizer.tokenize(input_str)
@@ -99,7 +98,7 @@ class UnixcoderForRetriever(Retriever):
         if not isinstance(input_str, str):
             source_ids = [self.tokenize(string, is_query) for string in input_str]
         else:
-            source_ids = self.tokenize(input_str, is_query)
+            source_ids = [self.tokenize(input_str, is_query)]
         
         source_ids = torch.tensor(source_ids, dtype=torch.long).to("cuda")
         mask = source_ids.ne(self.tokenizer.pad_token_id).to("cuda")
@@ -266,7 +265,7 @@ def build_model(args) -> Tuple[Generator, Retriever]:
     generator = Generator(args.generator_name_or_path, args)
     if args.retriever_name_or_path is None:
         retriever = None
-    elif "unixocder" in args.retriever_name_or_path.lower():
+    elif "unixcoder" in args.retriever_name_or_path.lower():
         logger.info("Using child class UnixcoderForRetriever !!!")
         retriever = UnixcoderForRetriever(args.retriever_name_or_path)
     else:
