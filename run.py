@@ -7,7 +7,6 @@ import json
 import numpy as np
 import random
 import multiprocessing
-from pathlib import Path
 from tqdm import tqdm
 from typing import List
 from torch.nn.utils import clip_grad_norm_
@@ -119,8 +118,7 @@ def main():
                         help="Path to pre-trained model: e.g. roberta-base" )   
     parser.add_argument("--retriever_name_or_path", default=None, type=str, required=False,
                         help="Path to pre-trained model: e.g. roberta-base" ) 
-    parser.add_argument("--weighted_parameters", default=None, type=str,
-                        help="Path to .pth file: e.g. roberta-base" )   
+    parser.add_argument("--weighted_parameters", default=None, type=str)   
     parser.add_argument("--output_dir", default=None, type=str, required=True,
                         help="The output directory where the model predictions and checkpoints will be written.")   
   
@@ -217,12 +215,11 @@ def main():
         if args.debug:
             train_data = data[:8000]
             valid_data = data[-800:]
-            benchmark.test_datasets["train"] = train_data[:100]
+            # benchmark.test_datasets["train"] = train_data[:100]
         else:
-            train_data = data[:-2000]
-            # train_data = data
-            valid_data = data[-2000:]
-            benchmark.test_datasets["train"] = data[:2000]
+            train_data = data[:-4000]
+            valid_data = data[-4000:]
+            # benchmark.test_datasets["train"] = data[:4000]
         benchmark.test_datasets["validation"] = valid_data
         
         with multiprocessing.Pool(
@@ -281,7 +278,7 @@ def main():
                 modified_scores = []
                 for feature in batch:
                     feature:InputFeatures
-                    relevant_documents = retriever.retrieve(feature.query, feature.document, args.sampled_code_num, False)
+                    relevant_documents = retriever.gumbel_retrieve(feature.query, feature.document, args.sampled_code_num)
                     scores = retriever.retrieve(feature.query, relevant_documents)
                     decoder_features.extend([
                         InputFeatures(
@@ -323,7 +320,7 @@ def main():
                                                      round(np.mean(losses[-100*args.gradient_accumulation_steps:]),4)))
                     
                     if args.do_valid and len(losses) // args.gradient_accumulation_steps % 1000 == 0:
-                        results_table = test(benchmark, ["train", "validation"] + testsets_name, generator, retriever, args, scheduler._step_count)
+                        results_table = test(benchmark, ["validation"] + testsets_name, generator, retriever, args, scheduler._step_count)
                         if results_table["validation"]["em"] > max_validation:
                             max_validation = results_table["validation"]["em"]
                             patience = 0

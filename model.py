@@ -3,6 +3,7 @@
 import numpy as np
 import logging
 import torch
+import os
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel
 from typing import Tuple, List, Union
@@ -20,6 +21,7 @@ class Retriever:
         else:
             self.model = AutoModel.from_pretrained(model_name_or_path, trust_remote_code=True)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.tempurate = 1.0
     
     def embedding(self, input_str:Union[str, List[str]], is_query:bool) -> torch.Tensor:
         if is_query:
@@ -30,6 +32,28 @@ class Retriever:
         embedding = self.model(**input_ids)[0][:, 0]
         embedding = torch.nn.functional.normalize(embedding, p=2, dim=1)
         return embedding
+    
+    def gumbel_retrieve(self, query_str:str, documents:List[CodeBlock], n:int=None) \
+        -> Union[torch.Tensor, List[CodeBlock]]:
+        assert n is not None
+            
+        if len(documents) == 0:
+            return []
+        
+        # 提供的文档数可能小于需要的文档数
+        n = min(n, len(documents))
+        
+        self.eval()
+        with torch.no_grad():
+            query_embedding = self.embedding(query_str, True)
+            document_embedding = self.embedding([doc.code_content for doc in documents], False)
+            scores = torch.matmul(query_embedding, document_embedding.T).squeeze(dim=0)
+            scores = torch.nn.functional.gumbel_softmax(scores, tau=self.tempurate)
+        self.train()
+        
+        _, top_indices = torch.topk(scores, n)
+        top_indices = top_indices.cpu().tolist()
+        return [documents[i] for i in top_indices]
     
     def retrieve(self, query_str:str, documents:List[CodeBlock], n:int=None, is_training:bool=True) \
         -> Union[torch.Tensor, List[CodeBlock]]:
@@ -79,6 +103,7 @@ class UnixcoderForRetriever(Retriever):
     def __init__(self, model_name_or_path:str):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
         self.model = AutoModel.from_pretrained(model_name_or_path)
+        self.tempurate = 1.0
         
     def tokenize(self, input_str, is_query):
         tokens = self.tokenizer.tokenize(input_str)
@@ -273,7 +298,8 @@ def build_model(args) -> Tuple[Generator, Retriever]:
         
     if args.weighted_parameters is not None:
         logger.info(f"load parameters from {args.weighted_parameters}")
-        retriever.model.load_state_dict(torch.load(args.weighted_parameters))
+        generator.model.load_state_dict(torch.load(os.path.join(args.weighted_parameters, "generator.pth")))
+        retriever.model.load_state_dict(torch.load(os.path.join(args.weighted_parameters, "retriever.pth")))
     
     generator.model.to(args.device)  
     logger.info("Finish loading generator [%s] from %s", get_model_size(generator.model), args.generator_name_or_path)
