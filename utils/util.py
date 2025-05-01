@@ -1,11 +1,10 @@
 import random
-import re
 import os
 import torch
 import pickle
 import numpy as np
 import rank_bm25
-from pathlib import Path
+from nltk import word_tokenize
 from tqdm import tqdm
 from typing import List, Dict
 from transformers import PreTrainedTokenizer, AutoTokenizer
@@ -27,7 +26,7 @@ class CodeBlock(object):
         """
         self.file_path:str = file_path
         self.code_content:str = code_content
-
+            
     def __str__(self):
         return f"#{self.file_path}\n{self.code_content}"
     
@@ -57,7 +56,6 @@ class InputFeatures(object):
         
 class Benchmarks(dict):
     def __init__(self, test_datasets, tokenizer:AutoTokenizer, args):
-        tokenizer_name = Path(args.generator_name_or_path).parts[-1]
         self.test_datasets = test_datasets
         self.test_features = {}
         self.tokenizer = tokenizer
@@ -85,13 +83,13 @@ def set_seed(seed=42):
     torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
 
-def load_dataset(datasetname:str, tokenizer_name:str, k:int) -> List[Example]:
+def load_dataset(datasetname:str, k:int) -> List[Example]:
     """
     Loads a dataset.
     :param datasetname: The name of the dataset to load.
     :return: The loaded dataset.
     """
-    file_name = f"{datasetname}-{tokenizer_name}-{k}.pkl"
+    file_name = f"{datasetname}-{k}.pkl"
     with open(f"preprocessed/{file_name}", 'rb') as f:
         dataset = pickle.load(f)
     
@@ -195,54 +193,16 @@ def split_into_smaller_blocks(code_block:CodeBlock, enable_fixed_block:bool) -> 
         
     return smaller_blocks
 
-def split_word(word:str) -> List[str]:
-    words = []
-    
-    if len(word) <= 1:
-        return word
+def split_sentence(code:str) -> List[str]:
+    return word_tokenize(code)
 
-    word_parts = re.split('[^0-9a-zA-Z]', word)
-    for part in word_parts:
-        part_len = len(part)
-        if part_len == 1:
-            words.append(part)
-            continue
-        word = ''
-        for index, char in enumerate(part):
-            # condition : level|A
-            if index == part_len - 1 and char.isupper() and part[index-1].islower():
-                if word != '':
-                    words.append(word)
-                words.append(char)
-                word = ''
-                
-            elif(index != 0 and index != part_len - 1 and char.isupper()):
-                # condition 1 : FIRST|Name
-                # condition 2 : first|Name
-                condition1 = part[index-1].isalpha() and part[index+1].islower()
-                condition2 = part[index-1].islower() and part[index+1].isalpha()
-                if condition1 or condition2:
-                    if word != '':
-                        words.append(word)
-                    word = char
-                else:
-                    word += char
-            
-            else:
-                word += char
-        
-        if word != '':
-            words.append(word)
-            
-    return [word.lower() for word in words]
-
-def bm25_retrieve(query_str:str, candidate_str:List[str], tokenizer:PreTrainedTokenizer, k:int):
+def bm25_retrieve(query_str:str, candidate_str:List[str], k:int):
     if k == 0 or len(candidate_str) == 0:
         return []
     # TODO: 将检索使用的token数量设置为一个参数
-    tokenized_corpus = [tokenizer.tokenize(doc) for doc in candidate_str]
+    tokenized_corpus = [split_sentence(doc) for doc in candidate_str]
     bm25_model = rank_bm25.BM25Okapi(tokenized_corpus)
-    query = tokenizer.tokenize(query_str)
+    query = split_sentence(query_str)
     doc_scores = bm25_model.get_scores(query)
     return doc_scores
 

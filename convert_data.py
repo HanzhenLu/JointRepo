@@ -19,7 +19,7 @@ def main():
     parser.add_argument("--input_dataset", default=None, type=str, required=True,
                         help="Path to dataset" )  
     parser.add_argument("--output_dir", default=None, type=str, required=True) 
-    parser.add_argument('--max_crossfile_length', default=1536, type=int,
+    parser.add_argument('--max_crossfile_length', default=512, type=int,
                         help="Max token num for crossfile")
     parser.add_argument('--max_input_length', default=2048, type=int,
                         help="Max token num for input feature")
@@ -28,6 +28,7 @@ def main():
     parser.add_argument('--workers', default=None, type=int,
                         help="Max token num for generating when evaluate")
     parser.add_argument("--with_retrieval", action="store_true")
+    parser.add_argument("--without_suffix", action="store_true")
     args = parser.parse_args()
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -49,7 +50,10 @@ def main():
         "retrieval_end_id": tokenizer.convert_tokens_to_ids("<RETRIEVAL_END>")
     }
     
-    input_dataset = pd.read_json(args.input_dataset)
+    try:
+        input_dataset = pd.read_json(args.input_dataset)
+    except ValueError:
+        input_dataset = pd.read_json(args.input_dataset, lines=True)
     examples = [Example(item_dict["task_id"], item_dict["left_context"], item_dict["right_context"], item_dict["groundtruth"], 
                         [CodeBlock(crossfile_context["path"], crossfile_context["text"]) for crossfile_context in item_dict["crossfile_context"]]) 
                 for _, item_dict in input_dataset.iterrows() if len(item_dict["crossfile_context"]) >= 1]
@@ -87,22 +91,28 @@ def main():
         else:
             max_allocated_length = args.max_input_length - len(feature.middle_ids) - 5
         
-        prefix_length = max_allocated_length // 2
-        suffix_length = max_allocated_length - prefix_length
-        if len(feature.prefix_ids) < prefix_length and len(feature.suffix_ids) < suffix_length:
-            prefix_ids = feature.prefix_ids
-            suffix_ids = feature.suffix_ids
-        elif len(feature.prefix_ids) < prefix_length:
-            prefix_ids = feature.prefix_ids
-            suffix_length = max_allocated_length - len(prefix_ids)
-            suffix_ids = feature.suffix_ids[:suffix_length]
-        elif len(feature.suffix_ids) < suffix_length:
-            suffix_ids = feature.suffix_ids
-            prefix_length = max_allocated_length - len(suffix_ids)
-            prefix_ids = feature.prefix_ids[-prefix_length:]
+        if args.without_suffix:
+            prefix_ids = feature.prefix_ids[-args.max_input_length:]
+            suffix_ids = []
+            
         else:
-            prefix_ids = feature.prefix_ids[-prefix_length:]
-            suffix_ids = feature.suffix_ids[:suffix_length]
+            prefix_length = max_allocated_length // 2
+            suffix_length = max_allocated_length - prefix_length
+        
+            if len(feature.prefix_ids) < prefix_length and len(feature.suffix_ids) < suffix_length:
+                prefix_ids = feature.prefix_ids
+                suffix_ids = feature.suffix_ids
+            elif len(feature.prefix_ids) < prefix_length:
+                prefix_ids = feature.prefix_ids
+                suffix_length = max_allocated_length - len(prefix_ids)
+                suffix_ids = feature.suffix_ids[:suffix_length]
+            elif len(feature.suffix_ids) < suffix_length:
+                suffix_ids = feature.suffix_ids
+                prefix_length = max_allocated_length - len(suffix_ids)
+                prefix_ids = feature.prefix_ids[-prefix_length:]
+            else:
+                prefix_ids = feature.prefix_ids[-prefix_length:]
+                suffix_ids = feature.suffix_ids[:suffix_length]
         
         if args.with_retrieval:
             input_ids = [special_token_ids["suffix_id"]] + suffix_ids + [special_token_ids["prefix_id"]] \
@@ -123,7 +133,7 @@ def main():
         output_dataset["labels"].append(labels)
     
     output_dataset = datasets.Dataset.from_dict(output_dataset)
-    output_dataset = output_dataset.train_test_split(test_size=0.0001)
+    output_dataset = output_dataset.train_test_split(test_size=0.01)
     del(tokenizer)
     output_dataset_dict = datasets.DatasetDict({"train": output_dataset["train"], "validation": output_dataset["test"]})
     output_dataset_dict.save_to_disk(args.output_dir)

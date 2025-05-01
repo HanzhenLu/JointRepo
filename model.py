@@ -79,7 +79,6 @@ class UnixcoderForRetriever(Retriever):
     def __init__(self, model_name_or_path:str):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
         self.model = AutoModel.from_pretrained(model_name_or_path)
-        self.model = torch.nn.DataParallel(self.model).cuda()
         
     def tokenize(self, input_str, is_query):
         tokens = self.tokenizer.tokenize(input_str)
@@ -99,7 +98,7 @@ class UnixcoderForRetriever(Retriever):
         if not isinstance(input_str, str):
             source_ids = [self.tokenize(string, is_query) for string in input_str]
         else:
-            source_ids = self.tokenize(input_str, is_query)
+            source_ids = [self.tokenize(input_str, is_query)]
         
         source_ids = torch.tensor(source_ids, dtype=torch.long).to("cuda")
         mask = source_ids.ne(self.tokenizer.pad_token_id).to("cuda")
@@ -114,21 +113,21 @@ class Generator:
         self.model = AutoModelForCausalLM.from_pretrained(model_name_or_path)
         # 特殊标记ID映射
         # TODO: 这需要根据模型进行改动
-        if "opc" in model_name_or_path or "llama" in model_name_or_path:
+        if "llama" == args.generator_type:
             self.special_token_ids = {
                 "prefix_id": self.tokenizer.convert_tokens_to_ids("<PREFIX>"),
                 "suffix_id": self.tokenizer.convert_tokens_to_ids("<SUFFIX>"),
                 "middle_id": self.tokenizer.convert_tokens_to_ids("<MIDDLE>"),
                 "eos_id": self.tokenizer.convert_tokens_to_ids("<EOS>")
             }
-        elif "deepseek" in model_name_or_path:
+        elif "deepseek" == args.generator_type:
             self.special_token_ids = {
                 "prefix_id": self.tokenizer.convert_tokens_to_ids("<｜fim▁begin｜>"),
                 "suffix_id": self.tokenizer.convert_tokens_to_ids("<｜fim▁end｜>"),
                 "middle_id": self.tokenizer.convert_tokens_to_ids("<｜fim▁hole｜>"),
                 "eos_id": self.tokenizer.eos_token_id
             }
-        elif "Qwen" in model_name_or_path:
+        elif "Qwen" == args.generator_type:
             self.special_token_ids = {
                 "prefix_id": self.tokenizer.convert_tokens_to_ids("<|fim_prefix|>"),
                 "suffix_id": self.tokenizer.convert_tokens_to_ids("<|fim_suffix|>"),
@@ -137,7 +136,7 @@ class Generator:
                 "file_sep_id": self.tokenizer.convert_tokens_to_ids("<|file_sep|>")
             }
         else:
-            raise RuntimeError("Unknown generator")
+            raise RuntimeError(f"Unknown model type {args.generator_type}")
         self.args = args
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -157,8 +156,8 @@ class Generator:
             else:
                 max_allocated_length = self.args.max_input_length - len(cross_file_context["input_ids"]) - 4
                 
-            if "Qwen" in self.args.generator_name_or_path:
-                max_allocated_length = self.args.max_input_length - len(cross_file_context["input_ids"]) - 5 - len(feature.project_name_ids)
+            if "Qwen" == self.args.generator_type:
+                max_allocated_length = self.args.max_input_length - len(cross_file_context["input_ids"]) - 3
             
             prefix_length = max_allocated_length // 2
             suffix_length = max_allocated_length - prefix_length
@@ -178,15 +177,18 @@ class Generator:
                 suffix_ids = feature.suffix_ids[:suffix_length]
             
             if is_training:
-                if "opc" in self.args.generator_name_or_path or "llama" in self.args.generator_name_or_path:
+                if "llama" == self.args.generator_type:
                     input_ids = [self.special_token_ids["suffix_id"]] + suffix_ids + [self.special_token_ids["prefix_id"]] \
                         + cross_file_context["input_ids"] + prefix_ids + [self.special_token_ids["middle_id"]] + \
                             middle_ids + [self.special_token_ids["eos_id"]]
                     
-                elif "deepseek" in self.args.generator_name_or_path:
+                elif "deepseek" == self.args.generator_type:
                     input_ids = [32013] + [self.special_token_ids["prefix_id"]] + cross_file_context["input_ids"] \
                         + prefix_ids + [self.special_token_ids["middle_id"]] + suffix_ids + [self.special_token_ids["suffix_id"]] \
                         + middle_ids + [self.special_token_ids["eos_id"]]
+                
+                else:
+                    raise RuntimeError(f"Unsupport model type {self.args.generator_type}")
                 
                 labels = [-100] * (len(input_ids) - len(middle_ids) - 1) \
                     + middle_ids + [self.special_token_ids["eos_id"]]
@@ -195,27 +197,27 @@ class Generator:
                 input_ids += [self.tokenizer.pad_token_id] * padding_length
                 attention_mask += [0] * padding_length
                 labels += [-100] * padding_length
-                assert len(input_ids) == len(attention_mask) == len(labels)
                 batch_input_ids.append(input_ids)
                 batch_attention_mask.append(attention_mask)
                 batch_labels.append(labels)
             else:
-                if "opc" in self.args.generator_name_or_path or "llama" in self.args.generator_name_or_path:
+                if "llama" == self.args.generator_type:
                     input_ids = [self.special_token_ids["suffix_id"]] + suffix_ids + [self.special_token_ids["prefix_id"]] \
                         + cross_file_context["input_ids"] + prefix_ids + [self.special_token_ids["middle_id"]]
-                elif "deepseek" in self.args.generator_name_or_path:
+                elif "deepseek" == self.args.generator_type:
                     input_ids = [32013] + [self.special_token_ids["prefix_id"]] + cross_file_context["input_ids"] \
                         + prefix_ids + [self.special_token_ids["middle_id"]] + suffix_ids + [self.special_token_ids["suffix_id"]]
-                elif "Qwen" in self.args.generator_name_or_path:
+                elif "Qwen" == self.args.generator_type:
                     input_ids = [self.special_token_ids["prefix_id"]] + cross_file_context["input_ids"] + \
                         prefix_ids + [self.special_token_ids["suffix_id"]] + \
                         suffix_ids + [self.special_token_ids["middle_id"]]
+                else:
+                    raise RuntimeError(f"Unsupport model type {self.args.generator_type}")
 
                 attention_mask = [1] * len(input_ids)
                 padding_length = self.args.max_input_length - len(input_ids)
                 input_ids = [self.tokenizer.pad_token_id] * padding_length + input_ids
                 attention_mask = [0] * padding_length + attention_mask
-                assert len(input_ids) == len(attention_mask)
                 batch_input_ids.append(input_ids)
                 batch_attention_mask.append(attention_mask)
             
@@ -283,7 +285,7 @@ def build_model(args) -> Tuple[Generator, Retriever]:
     generator = Generator(args.generator_name_or_path, args)
     if args.retriever_name_or_path is None:
         retriever = None
-    elif "unixocder" in args.retriever_name_or_path.lower():
+    elif "unixcoder" in args.retriever_name_or_path.lower():
         logger.info("Using child class UnixcoderForRetriever !!!")
         retriever = UnixcoderForRetriever(args.retriever_name_or_path)
     else:

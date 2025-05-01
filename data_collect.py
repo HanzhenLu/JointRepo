@@ -17,8 +17,9 @@ from collections import defaultdict
 from typing import Dict, List, Tuple
 from functools import partial
 from tqdm import tqdm
-from transformers import AutoTokenizer
-from utils.util import split_into_smaller_blocks, CodeBlock
+from utils.util import split_into_smaller_blocks, split_sentence, CodeBlock
+
+global_args = None
 
 # 定义允许的字符集合
 ALLOWED = set(
@@ -172,7 +173,9 @@ def construct_data_repo(code_content:str) -> Tuple[str, str, str]:
     return prefix, suffix, middle
     
 
-def process_repository(repo_name, tokenizer, construct_data_fn):
+def process_repository(repo_name, construct_data_fn):
+    global global_args
+    
     """处理单个仓库的独立函数"""
     with open(os.path.join(TEMP_DIR, repo_name), 'r') as f:
         file_content_map = json.loads(f.read())
@@ -190,7 +193,7 @@ def process_repository(repo_name, tokenizer, construct_data_fn):
     
     # BM25模型构建
     corpus = [x.code_content for x in code_blocks]
-    tokenized_corpus = [tokenizer.tokenize(doc) for doc in corpus]
+    tokenized_corpus = [split_sentence(doc) for doc in corpus]
     bm25_model = rank_bm25.BM25Okapi(tokenized_corpus)
     
     # 样本生成
@@ -211,10 +214,16 @@ def process_repository(repo_name, tokenizer, construct_data_fn):
         }
         
         # 查询构建逻辑
-        prefix_part = prefix.split("\n")[-8:]
-        suffix_clean = [line for line in suffix.split('\n') if line.strip()]
-        remaining = 15 - len(prefix_part)
-        suffix_part = suffix_clean[:remaining]
+        if global_args.without_suffix:
+            prefix_clean = [line for line in prefix.split('\n') if line.strip()]
+            prefix_part = prefix_clean[-15:]
+            suffix_part = [""]
+        else:
+            prefix_clean = [line for line in prefix.split('\n') if line.strip()]
+            prefix_part = prefix_clean[8:]
+            suffix_clean = [line for line in suffix.split('\n') if line.strip()]
+            remaining = 15 - len(prefix_part)
+            suffix_part = suffix_clean[:remaining]
         
         # 增加检索到有用信息的概率
         if random.random() > 0.5:
@@ -223,7 +232,7 @@ def process_repository(repo_name, tokenizer, construct_data_fn):
             query_str = "\n".join(prefix_part) + middle + "\n".join(suffix_part)
         
         # BM25检索
-        query = tokenizer.tokenize(query_str)
+        query = split_sentence(query_str)
         doc_scores = bm25_model.get_scores(query)
         sorted_indices = np.argsort(doc_scores)[::-1][:50]
         
@@ -238,7 +247,7 @@ def process_repository(repo_name, tokenizer, construct_data_fn):
         ]
         
         samples.append(sample)
-        if len(samples) >= 200:
+        if len(samples) >= 10:
             break
     
     return samples
@@ -250,10 +259,10 @@ if __name__ == "__main__":
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--workers", default=1, type=int)
     parser.add_argument("--repocoder", action="store_true")
-    
-    tokenizer = AutoTokenizer.from_pretrained("/data/hanzhenlu/LLaMA-Factory/saves/llama_100m_SPM_pretrained_sft_v4")
+    parser.add_argument("--without_suffix", action="store_true")
     
     args = parser.parse_args()
+    global_args = args
     
     if args.dataset_name == "self-collected":
         root = "github_projects"
@@ -298,15 +307,16 @@ if __name__ == "__main__":
     
     keys = list(repo_dict.keys())
     del(repo_dict)
+    del(raw_data)
     if args.debug:
         random.shuffle(keys)
-        keys = keys[:len(keys) // 20]
+        keys = keys[:len(keys) // 10]
     dataframe = {"task_id":[], "path":[], "left_context":[], "right_context":[], "crossfile_context":[], "groundtruth":[]}
     
     if args.repocoder:
-        process_fn = partial(process_repository, tokenizer=tokenizer, construct_data_fn=construct_data_repo)
+        process_fn = partial(process_repository, construct_data_fn=construct_data_repo)
     else:
-        process_fn = partial(process_repository, tokenizer=tokenizer, construct_data_fn=construct_data)
+        process_fn = partial(process_repository, construct_data_fn=construct_data)
     
     with multiprocessing.Pool(processes=args.workers) as pool:
         results = list(tqdm(
@@ -334,6 +344,6 @@ if __name__ == "__main__":
     if args.repocoder:
         dataframe.to_json(f"data/github_projects/python/{args.dataset_name}-repocoder_4_15.json")
     else:
-        dataframe.to_json(f"data/github_projects/python/{args.dataset_name}-train_4_18.json")
+        dataframe.to_json(f"data/github_projects/python/{args.dataset_name}_4_26_without_suffix.json")
     
     shutil.rmtree(TEMP_DIR)

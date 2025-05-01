@@ -5,11 +5,12 @@ import torch
 from typing import List, Dict
 from transformers import AutoTokenizer, AutoModelForCausalLM, PreTrainedTokenizer
 from tqdm import tqdm
-from pathlib import Path
 from utils.util import Example, CodeBlock, load_dataset, check_memory
 from utils.eval_repoeval import compute_EM
 from model import Retriever, UnixcoderForRetriever
 from utils.eval_util import process_examples
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 class InputFeatures(object):
     """A single training/test features for a example."""
@@ -129,7 +130,10 @@ class Generator:
                 input_ids = [32013] + [self.special_token_ids["prefix_id"]] + cross_file_context["input_ids"] \
                     + prefix_ids + [self.special_token_ids["middle_id"]] + suffix_ids + [self.special_token_ids["suffix_id"]]
             elif "Qwen" in self.args.generator_name_or_path:
-                input_ids = [self.special_token_ids["prefix_id"]] + prefix_ids + [self.special_token_ids["middle_id"]] + suffix_ids + [self.special_token_ids["suffix_id"]]
+                input_ids = [self.special_token_ids["prefix_id"]] + cross_file_context["input_ids"] + \
+                        prefix_ids + [self.special_token_ids["suffix_id"]] + \
+                        suffix_ids + [self.special_token_ids["middle_id"]]
+            
             attention_mask = [1] * len(input_ids)
             padding_length = self.args.max_input_length - len(input_ids)
             input_ids = [self.tokenizer.pad_token_id] * padding_length + input_ids
@@ -153,7 +157,7 @@ class Generator:
                 else:
                     model_to_generate = self.model
                 generated_ids = model_to_generate.generate(input_ids, attention_mask=attention_mask, 
-                    max_length=input_ids.size(1)+self.args.max_generation_length, pad_token_id=self.tokenizer.pad_token_id)
+                    max_new_tokens=self.args.max_generation_length, pad_token_id=self.tokenizer.pad_token_id)
                 batch_generated_ids.extend(generated_ids[:, input_ids.size(1):])
         return [self.tokenizer.decode(generated_id, skip_special_tokens=True) for generated_id in batch_generated_ids]
         
@@ -168,6 +172,7 @@ def main():
     
     parser.add_argument("--small_model_prediction", type=str, required=True)
     parser.add_argument("--generator_name_or_path", type=str, required=True)
+    parser.add_argument("--")
     parser.add_argument("--retriever_name_or_path", type=str, required=True)
     parser.add_argument("--weighted_parameters", default=None, type=str,
                         help="Path to .pth file: e.g. roberta-base" )   
@@ -175,8 +180,9 @@ def main():
                         help="Total number of relevant code blocks to use")
     parser.add_argument("--GPU_ids", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
-    parser.add_argument("--sampled_code_num", type=int, default=10)
+    parser.add_argument("--sampled_code_num", type=int, default=5)
     parser.add_argument("--using_completion", action="store_true")
+    parser.add_argument("--only_prefix", action="store_true")
     parser.add_argument('--max_input_length', default=2048, type=int,
                         help="Max token num for input feature")
     parser.add_argument('--max_crossfile_length', default=1536, type=int,
@@ -201,14 +207,13 @@ def main():
     generator = Generator(args.generator_name_or_path, args)
     generator.model.to(args.device)
     generator.eval()
-    tokenizer_name = Path(args.generator_name_or_path).parts[-1]
     check_memory()
     
     test_datasets = {
-        "ours": load_dataset("ours", tokenizer_name, args.sampled_code_num*5),
-        "ours_suffix": load_dataset("ours-suffix", tokenizer_name, args.sampled_code_num*5),
-        "cceval_python": load_dataset("cceval", tokenizer_name, args.sampled_code_num*5),
-        "repoeval_line": load_dataset("repoeval", tokenizer_name, args.sampled_code_num*5)
+        "ours": load_dataset("ours", args.sampled_code_num*5),
+        "ours_suffix": load_dataset("ours-suffix", args.sampled_code_num*5),
+        "cceval_python": load_dataset("cceval", args.sampled_code_num*5),
+        "repoeval_line": load_dataset("repoeval", args.sampled_code_num*5)
     }
     
     for name, examples in test_datasets.items():
@@ -239,16 +244,9 @@ def main():
 
             # 合并结果
             if args.using_completion:
-                query_str = "\n".join(prefix_part) + wrong_completion[example.task_id] + "\n".join(suffix_part)
+                query_str = wrong_completion[example.task_id]
             else:
                 query_str = "\n".join(prefix_part + suffix_part)
-            
-            # if args.using_completion:
-            #     completion:str = wrong_completion[example.task_id]
-            #     completion = "".join(["#" + line for line in completion.splitlines(keepends=True)])
-            #     completion = "\n" + completion + "\n"
-                
-            #     completion_prefix = "\n".join(prefix_line[:-1]) + completion + prefix_line[-1]
             
             prefix_tokenized_result = generator.tokenizer(example.prefix, add_special_tokens=False)
             suffix_tokenized_result = generator.tokenizer(example.suffix, add_special_tokens=False)
