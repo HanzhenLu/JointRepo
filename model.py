@@ -134,11 +134,11 @@ class UnixcoderForRetriever(Retriever):
     
 class Generator:
     def __init__(self, model_name_or_path:str, args):
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
-        self.model = AutoModelForCausalLM.from_pretrained(model_name_or_path)
+        self.tokenizer:AutoTokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+        self.model:AutoModelForCausalLM = AutoModelForCausalLM.from_pretrained(model_name_or_path)
         # 特殊标记ID映射
         # TODO: 这需要根据模型进行改动
-        if "opc" in model_name_or_path or "llama" in model_name_or_path:
+        if "opc" in model_name_or_path or "llama" in model_name_or_path or "pretrain" in model_name_or_path:
             self.special_token_ids = {
                 "prefix_id": self.tokenizer.convert_tokens_to_ids("<PREFIX>"),
                 "suffix_id": self.tokenizer.convert_tokens_to_ids("<SUFFIX>"),
@@ -157,6 +157,38 @@ class Generator:
         self.args = args
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
+    def truncate_context(self, prefix_ids, suffix_ids, allocated_length):
+        # 根据allocated_length尽量均衡地截断上文和下文
+        
+        prefix_length = allocated_length // 2
+        suffix_length = allocated_length - prefix_length
+        if len(prefix_ids) < prefix_length and len(suffix_ids) < suffix_length:
+            return prefix_ids, suffix_ids
+            
+        elif len(prefix_ids) < prefix_length:
+            suffix_length = allocated_length - len(prefix_ids)
+            return prefix_ids, suffix_ids[:suffix_length]
+        
+        elif len(suffix_ids) < suffix_length:
+            prefix_length = allocated_length - len(suffix_ids)
+            return prefix_ids[-prefix_length:], suffix_ids
+        else:
+            return prefix_ids[-prefix_length:], suffix_ids[:suffix_length]
+        
+    def construct_prompt(self, prefix_ids, suffix_ids, cross_file_context, middle_ids=None):
+        if "opc" in self.args.generator_name_or_path or "llama" in self.args.generator_name_or_path or "pretrain" in self.args.generator_name_or_path:
+            input_ids = [self.special_token_ids["suffix_id"]] + suffix_ids + [self.special_token_ids["prefix_id"]] \
+                + cross_file_context["input_ids"] + prefix_ids + [self.special_token_ids["middle_id"]]
+            
+        elif "deepseek" in self.args.generator_name_or_path:
+            input_ids = [32013] + [self.special_token_ids["prefix_id"]] + cross_file_context["input_ids"] \
+                + prefix_ids + [self.special_token_ids["middle_id"]] + suffix_ids + [self.special_token_ids["suffix_id"]]
+        
+        if middle_ids is not None:
+            input_ids += middle_ids + middle_ids + [self.special_token_ids["eos_id"]]
+        
+        return input_ids
+    
     def generate(self, input_batch:List[InputFeatures], is_training:bool):
         batch_input_ids = []
         batch_attention_mask = []
@@ -169,36 +201,14 @@ class Generator:
             
             # 计算分配长度
             if is_training:
-                max_allocated_length = self.args.max_input_length - len(cross_file_context["input_ids"]) - len(middle_ids) - 5
+                max_allocated_length = self.args.max_input_length - self.args.max_crossfile_length - len(middle_ids) - 5
             else:
                 max_allocated_length = self.args.max_input_length - len(cross_file_context["input_ids"]) - 4
-            prefix_length = max_allocated_length // 2
-            suffix_length = max_allocated_length - prefix_length
-            if len(feature.prefix_ids) < prefix_length and len(feature.suffix_ids) < suffix_length:
-                prefix_ids = feature.prefix_ids
-                suffix_ids = feature.suffix_ids
-            elif len(feature.prefix_ids) < prefix_length:
-                prefix_ids = feature.prefix_ids
-                suffix_length = max_allocated_length - len(prefix_ids)
-                suffix_ids = feature.suffix_ids[:suffix_length]
-            elif len(feature.suffix_ids) < suffix_length:
-                suffix_ids = feature.suffix_ids
-                prefix_length = max_allocated_length - len(suffix_ids)
-                prefix_ids = feature.prefix_ids[-prefix_length:]
-            else:
-                prefix_ids = feature.prefix_ids[-prefix_length:]
-                suffix_ids = feature.suffix_ids[:suffix_length]
+            
+            prefix_ids, suffix_ids = self.truncate_context(feature.prefix_ids, feature.suffix_ids, max_allocated_length)
             
             if is_training:
-                if "opc" in self.args.generator_name_or_path or "llama" in self.args.generator_name_or_path:
-                    input_ids = [self.special_token_ids["suffix_id"]] + suffix_ids + [self.special_token_ids["prefix_id"]] \
-                        + cross_file_context["input_ids"] + prefix_ids + [self.special_token_ids["middle_id"]] + \
-                            middle_ids + [self.special_token_ids["eos_id"]]
-                    
-                elif "deepseek" in self.args.generator_name_or_path:
-                    input_ids = [32013] + [self.special_token_ids["prefix_id"]] + cross_file_context["input_ids"] \
-                        + prefix_ids + [self.special_token_ids["middle_id"]] + suffix_ids + [self.special_token_ids["suffix_id"]] \
-                        + middle_ids + [self.special_token_ids["eos_id"]]
+                input_ids = self.construct_prompt(prefix_ids, suffix_ids, cross_file_context, middle_ids)
                 
                 labels = [-100] * (len(input_ids) - len(middle_ids) - 1) \
                     + middle_ids + [self.special_token_ids["eos_id"]]
@@ -207,22 +217,16 @@ class Generator:
                 input_ids += [self.tokenizer.pad_token_id] * padding_length
                 attention_mask += [0] * padding_length
                 labels += [-100] * padding_length
-                assert len(input_ids) == len(attention_mask) == len(labels)
                 batch_input_ids.append(input_ids)
                 batch_attention_mask.append(attention_mask)
                 batch_labels.append(labels)
             else:
-                if "opc" in self.args.generator_name_or_path or "llama" in self.args.generator_name_or_path:
-                    input_ids = [self.special_token_ids["suffix_id"]] + suffix_ids + [self.special_token_ids["prefix_id"]] \
-                        + cross_file_context["input_ids"] + prefix_ids + [self.special_token_ids["middle_id"]]
-                elif "deepseek" in self.args.generator_name_or_path:
-                    input_ids = [32013] + [self.special_token_ids["prefix_id"]] + cross_file_context["input_ids"] \
-                        + prefix_ids + [self.special_token_ids["middle_id"]] + suffix_ids + [self.special_token_ids["suffix_id"]]
+                input_ids = self.construct_prompt(prefix_ids, suffix_ids, cross_file_context)
+                
                 attention_mask = [1] * len(input_ids)
                 padding_length = self.args.max_input_length - len(input_ids)
                 input_ids = [self.tokenizer.pad_token_id] * padding_length + input_ids
                 attention_mask = [0] * padding_length + attention_mask
-                assert len(input_ids) == len(attention_mask)
                 batch_input_ids.append(input_ids)
                 batch_attention_mask.append(attention_mask)
             
@@ -273,6 +277,66 @@ class Generator:
                     max_length=input_ids.size(1)+self.args.max_generation_length, pad_token_id=self.tokenizer.pad_token_id)
                 batch_generated_ids.extend(generated_ids[:, input_ids.size(1):])
             return [self.tokenizer.decode(generated_id, skip_special_tokens=True) for generated_id in batch_generated_ids]
+
+    def check_generation(self, input_batch:List[InputFeatures]) -> List[bool]:
+        self.eval()
+        output = []
+        
+        for feature in input_batch:
+            cross_file_context = get_cross_file_context(feature.document, self.tokenizer, self.args.max_crossfile_length)
+            middle_ids = feature.middle_ids[:self.args.max_generation_length]
+            max_allocated_length = self.args.max_input_length - self.args.max_crossfile_length - len(middle_ids) - 5
+            prefix_ids, suffix_ids = self.truncate_context(feature.prefix_ids, feature.suffix_ids, max_allocated_length)
+            
+            input_ids = self.construct_prompt(prefix_ids, suffix_ids, cross_file_context)
+            labels = feature.middle_ids
+
+            # 处理labels为空的情况
+            n = len(labels)
+            if n == 0:
+                output.append(True)
+        
+            input_ids = torch.tensor(input_ids)
+            labels = torch.tensor(labels)
+            input_ids = input_ids
+            m = input_ids.size(0)
+        
+            max_length = m + n - 1
+            batch_size = n
+        
+            # 初始化批处理张量
+            input_ids_batch = torch.full((batch_size, max_length), self.tokenizer.pad_token_id, dtype=torch.long, device=self.device)
+            attention_mask_batch = torch.zeros((batch_size, max_length), dtype=torch.long, device=self.device)
+        
+            # 填充每个样本的输入和注意力掩码
+            for i in range(n):
+                # 填充原始输入
+                input_ids_batch[i, :m] = input_ids
+                
+                # 填充标签部分（当i>0时）
+                if i > 0:
+                    input_ids_batch[i, m:m+i] = labels[:i]
+                
+                # 设置注意力掩码
+                attention_mask_batch[i, :m+i] = 1
+        
+            # 模型前向传播
+            with torch.no_grad():
+                outputs = self.model(input_ids=input_ids_batch, attention_mask=attention_mask_batch)
+        
+            # 获取各样本最后一个有效位置的logits
+            logits = outputs.logits  # (batch_size, seq_len, vocab_size)
+            lengths = m + torch.arange(batch_size, device=self.device)  # 各样本有效长度
+            last_indices = lengths - 1  # 最后有效位置索引
+        
+            # 收集预测结果
+            batch_indices = torch.arange(batch_size, device=self.device)
+            predicted_token_ids = logits[batch_indices, last_indices].argmax(dim=-1).cpu()
+        
+            # 验证结果
+            output.append(torch.all(predicted_token_ids == labels).item())
+        self.train()
+        return output
         
     def eval(self):
         self.model.eval()

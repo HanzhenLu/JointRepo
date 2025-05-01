@@ -7,6 +7,7 @@ import json
 import numpy as np
 import random
 import multiprocessing
+import torch.nn.functional as F
 from tqdm import tqdm
 from typing import List
 from torch.nn.utils import clip_grad_norm_
@@ -162,7 +163,7 @@ def main():
                         help="Total number of code blocks will be sampled")
     parser.add_argument('--max_input_length', default=2048, type=int,
                         help="Max token num for input feature")
-    parser.add_argument('--max_crossfile_length', default=1536, type=int,
+    parser.add_argument('--max_crossfile_length', default=512, type=int,
                         help="Max token num for crossfile")
     parser.add_argument('--max_generation_length', default=64, type=int,
                         help="Max token num for generating when evaluate")
@@ -274,13 +275,13 @@ def main():
                 retriever.train()
                 
                 loss = None
-                decoder_features = []
-                modified_scores = []
+                # 用于收集需要微调的feature，以便一整个batch一起优化
+                batch_features = []
                 for feature in batch:
                     feature:InputFeatures
                     relevant_documents = retriever.gumbel_retrieve(feature.query, feature.document, args.sampled_code_num)
                     scores = retriever.retrieve(feature.query, relevant_documents)
-                    decoder_features.extend([
+                    decoder_features = [
                         InputFeatures(
                             feature.prefix_ids,
                             feature.suffix_ids,
@@ -288,12 +289,30 @@ def main():
                             document=[document]
                         )
                         for document in relevant_documents
-                    ])
-                    modified_scores.append(softmax(scores))                    
+                    ]
+                    
+                    result = generator.check_generation(decoder_features)
+                    
+                    if any(result):
+                        # 如果在一些检索内容的帮助下能生成成功，那么就在这些能生成成功的样例上进行微调，相似度使用对比学习进行优化
+                        batch_features.extend([f for r, f in zip(result, decoder_features) if r])
+                        targets = torch.tensor(result[:-1], dtype=torch.float32).unsqueeze(0)
+                        current_loss = F.binary_cross_entropy(scores.unsqueeze(0), targets)
+                        loss = current_loss if loss is None else current_loss + loss
+                    else:
+                        # 如果无论怎么样都不能做对，那么就只在没有检索内容的样例上微调生成器
+                        batch_features.append(InputFeatures(
+                            feature.prefix_ids,
+                            feature.suffix_ids,
+                            feature.middle_ids,
+                            document=[]
+                        ))
                 
-                feature_loss = generator.generate(decoder_features, True)
-                batch_score = torch.cat(modified_scores)
-                loss = torch.dot(batch_score, feature_loss)
+                # 如果这个batch有feature需要微调，调用generate生成每个feature的loss
+                if batch_features:
+                    feature_loss = generator.generate(batch_features, True)
+                    loss = feature_loss.sum() if loss is None else loss + feature_loss.sum() 
+                
                 
                 if args.gradient_accumulation_steps > 1:
                     loss = loss / args.gradient_accumulation_steps
