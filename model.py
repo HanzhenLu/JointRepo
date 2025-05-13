@@ -185,7 +185,7 @@ class Generator:
                 + prefix_ids + [self.special_token_ids["middle_id"]] + suffix_ids + [self.special_token_ids["suffix_id"]]
         
         if middle_ids is not None:
-            input_ids += middle_ids + middle_ids + [self.special_token_ids["eos_id"]]
+            input_ids = input_ids + middle_ids + [self.special_token_ids["eos_id"]]
         
         return input_ids
     

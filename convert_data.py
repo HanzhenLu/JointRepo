@@ -92,30 +92,30 @@ def main():
             max_allocated_length = args.max_input_length - len(feature.middle_ids) - 5
         
         if args.without_suffix:
-            prefix_length = max_allocated_length
-            suffix_length = 0
+            prefix_ids = feature.prefix_ids[-max_allocated_length:]
+            suffix_ids = []
+            
         else:
             prefix_length = max_allocated_length // 2
             suffix_length = max_allocated_length - prefix_length
         
-        if len(feature.prefix_ids) < prefix_length and len(feature.suffix_ids) < suffix_length:
-            prefix_ids = feature.prefix_ids
-            suffix_ids = feature.suffix_ids
-        elif len(feature.prefix_ids) < prefix_length:
-            prefix_ids = feature.prefix_ids
-            suffix_length = max_allocated_length - len(prefix_ids)
-            suffix_ids = feature.suffix_ids[:suffix_length]
-        elif len(feature.suffix_ids) < suffix_length:
-            suffix_ids = feature.suffix_ids
-            prefix_length = max_allocated_length - len(suffix_ids)
-            prefix_ids = feature.prefix_ids[-prefix_length:]
-        else:
-            prefix_ids = feature.prefix_ids[-prefix_length:]
-            suffix_ids = feature.suffix_ids[:suffix_length]
+            if len(feature.prefix_ids) < prefix_length and len(feature.suffix_ids) < suffix_length:
+                prefix_ids = feature.prefix_ids
+                suffix_ids = feature.suffix_ids
+            elif len(feature.prefix_ids) < prefix_length:
+                prefix_ids = feature.prefix_ids
+                suffix_length = max_allocated_length - len(prefix_ids)
+                suffix_ids = feature.suffix_ids[:suffix_length]
+            elif len(feature.suffix_ids) < suffix_length:
+                suffix_ids = feature.suffix_ids
+                prefix_length = max_allocated_length - len(suffix_ids)
+                prefix_ids = feature.prefix_ids[-prefix_length:]
+            else:
+                prefix_ids = feature.prefix_ids[-prefix_length:]
+                suffix_ids = feature.suffix_ids[:suffix_length]
         
         if args.with_retrieval:
-            input_ids = [special_token_ids["suffix_id"]] + suffix_ids + [special_token_ids["prefix_id"]] \
-                        + [special_token_ids["retrieval_start_id"]] + cross_file_context["input_ids"] + [special_token_ids["retrieval_end_id"]] \
+            input_ids = [special_token_ids["suffix_id"]] + suffix_ids + [special_token_ids["prefix_id"]] + cross_file_context["input_ids"] \
                         + prefix_ids + [special_token_ids["middle_id"]] + feature.middle_ids + [special_token_ids["eos_id"]]
         else:
             input_ids = [special_token_ids["suffix_id"]] + suffix_ids + [special_token_ids["prefix_id"]] \

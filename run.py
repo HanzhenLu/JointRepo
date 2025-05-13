@@ -264,7 +264,6 @@ def main():
         logger.info("  Num epoch = %d", args.num_train_epochs)
         
         losses = []
-        softmax = torch.nn.Softmax(dim=-1)
         
         patience = 0
         max_validation = 0
@@ -296,8 +295,12 @@ def main():
                     if any(result):
                         # 如果在一些检索内容的帮助下能生成成功，那么就在这些能生成成功的样例上进行微调，相似度使用对比学习进行优化
                         batch_features.extend([f for r, f in zip(result, decoder_features) if r])
-                        targets = torch.tensor(result[:-1], dtype=torch.float32).unsqueeze(0)
-                        current_loss = F.binary_cross_entropy(scores.unsqueeze(0), targets)
+                        pos_mask = torch.tensor(result, dtype=torch.bool).to(device)
+                        pos_sim = scores[pos_mask]
+                        neg_sim = scores[~pos_mask]
+                        numerator = torch.exp(pos_sim).sum()
+                        denominator = numerator + torch.exp(neg_sim).sum()
+                        current_loss = -torch.log(numerator / denominator).mean()
                         loss = current_loss if loss is None else current_loss + loss
                     else:
                         # 如果无论怎么样都不能做对，那么就只在没有检索内容的样例上微调生成器
@@ -338,7 +341,7 @@ def main():
                                                      scheduler.get_lr()[0],
                                                      round(np.mean(losses[-100*args.gradient_accumulation_steps:]),4)))
                     
-                    if args.do_valid and len(losses) // args.gradient_accumulation_steps % 1000 == 0:
+                    if args.do_valid and len(losses) // args.gradient_accumulation_steps % 2000 == 0:
                         results_table = test(benchmark, ["validation"] + testsets_name, generator, retriever, args, scheduler._step_count)
                         if results_table["validation"]["em"] > max_validation:
                             max_validation = results_table["validation"]["em"]
