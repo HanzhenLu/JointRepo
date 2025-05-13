@@ -1,5 +1,7 @@
 from __future__ import absolute_import
 import os
+os.environ["ACCELERATE_USE_DEEPSPEED"] = "false"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import torch
 import random
 import logging
@@ -77,7 +79,6 @@ def convert_example_to_feature(prefix:str, suffix:str, middle:str, related_codes
         print(len(middle_ids))
     assert len(feature.input_ids) == len(feature.target_ids) == args.max_input_length
     return feature
-  
 
 class MyDataset(Dataset):
     def __init__(self, features) -> None:
@@ -104,14 +105,22 @@ def test(all_eval_examples:Dict[str, List[Example]], generator:PreTrainedModel, 
         with open(f"{args.output_dir}/result_{epoch}/{name}/prediction.jsonl", "w", encoding="utf-8") as f_pred:
             for example, generation in zip(examples, generations):
                 f_pred.write(json.dumps({"task_id": example.task_id, "pred": generation}) + "\n")
-        if name == "cceval_python":
+        if name == "cceval_python" or name == "cceval_python_only_prefix":
             results = compute_metric_stmt(f"{args.output_dir}/result_{epoch}/{name}", "data/cceval/python/test.jsonl")
-        elif name == "repoeval_line":
+        elif name == "repoeval_line" or name == "repoeval_line_only_prefix":
             results = compute_metric_stmt(f"{args.output_dir}/result_{epoch}/{name}", "data/repoeval/line_level/test.jsonl")
-        elif name == "ours":
+        elif name == "repoeval_api" or name == "repoeval_api_only_prefix":
+            results = compute_metric_stmt(f"{args.output_dir}/result_{epoch}/{name}", "data/repoeval/api_level/test.jsonl")
+        elif name == "repoeval_func":
+            results = compute_metric_stmt(f"{args.output_dir}/result_{epoch}/{name}", "preprocessed/repoeval_func-test.jsonl")
+        elif name == "ours" or name == "ours_only_prefix":
             results = compute_metric_stmt(f"{args.output_dir}/result_{epoch}/{name}", "data/ours/python/test.jsonl")
-        elif name == "ours_suffix":
+        elif name == "ours_suffix" or name == "ours_suffix_only_prefix":
             results = compute_metric_stmt(f"{args.output_dir}/result_{epoch}/{name}", "data/ours/python/test_suffix.jsonl")
+        elif name == "ours_func":
+            results = compute_metric_stmt(f"{args.output_dir}/result_{epoch}/{name}", "preprocessed/ours-func-test.jsonl")        
+        elif name == "real_case":
+            results = compute_metric_stmt(f"{args.output_dir}/result_{epoch}/{name}", "data/real_test_without_comment_one_line/test.jsonl")
         elif name == "github_projects":
             targets, generations = ["".join(x.middle.split()) for x in examples], ["".join(x.split()) for x in generations]
             results = {}
@@ -131,7 +140,8 @@ def main():
 
     ## Required parameters  
     parser.add_argument("--model_name_or_path", default=None, type=str, required=True,
-                        help="Path to pre-trained model: e.g. roberta-base" )   
+                        help="Path to pre-trained model: e.g. roberta-base" )  
+    parser.add_argument("--model_type", default=None, type=str, required=True, choices=["llama", "deepseek", "Qwen"])  
     parser.add_argument("--weighted_parameters", default=None, type=str,
                         help="Path to .pth file: e.g. roberta-base" )   
     parser.add_argument("--output_dir", default=None, type=str, required=True,
@@ -146,6 +156,10 @@ def main():
                         help="Whether to run validation.")
     parser.add_argument("--do_test", action='store_true',
                         help="Whether to run validation.")
+    parser.add_argument("--only_prefix", action='store_true')
+    parser.add_argument("--real_case", action='store_true')
+    parser.add_argument("--ntp", action="store_true")
+    parser.add_argument("--unixcoder", action="store_true")
     
     parser.add_argument("--train_batch_size", default=8, type=int,
                         help="Batch size per GPU/CPU for training.")
@@ -178,6 +192,15 @@ def main():
     # print arguments
     args = parser.parse_args()
     
+    if args.ntp:
+        assert args.only_prefix
+    
+    # set device
+    os.environ["CUDA_VISIBLE_DEVICES"]=args.GPU_ids
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    args.n_gpu = torch.cuda.device_count()
+    args.device = device
+    
     # make dir if output_dir not exist
     if os.path.exists(args.output_dir) is False:
         os.makedirs(args.output_dir)
@@ -192,11 +215,6 @@ def main():
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(name)s -   %(message)s')
     fh.setFormatter(formatter)
     logger.addHandler(fh)
-    # set device
-    os.environ["CUDA_VISIBLE_DEVICES"]=args.GPU_ids
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    args.n_gpu = torch.cuda.device_count()
-    args.device = device
     logger.info("device: %s, n_gpu: %s",device, args.n_gpu)
     
     # Set seed
@@ -206,12 +224,42 @@ def main():
     generator, tokenizer = build_model(args)
     tokenizer_name = Path(args.model_name_or_path).parts[-1]
     
-    all_eval_examples = {
-        "ours": load_dataset_from_path("preprocessed/ours-5.pkl"),
-        "ours_suffix": load_dataset_from_path("preprocessed/ours-suffix-5.pkl"),
-        "cceval_python": load_dataset_from_path("preprocessed/cceval-5.pkl"),
-        "repoeval_line": load_dataset_from_path("preprocessed/repoeval-5.pkl")
-    }
+    if args.only_prefix and args.real_case:
+        raise RuntimeError("invalid combination")
+    
+    preprocessed_dir = "preprocessed"
+    if args.only_prefix:
+        all_eval_examples = {
+            "repoeval_line_only_prefix": load_dataset_from_path(f"{preprocessed_dir}/repoeval_line_only_prefix-5.pkl"),
+            "ours_only_prefix": load_dataset_from_path(f"{preprocessed_dir}/ours_only_prefix-5.pkl"),
+            "ours_suffix_only_prefix": load_dataset_from_path(f"{preprocessed_dir}/ours-suffix_only_prefix-5.pkl"),
+            "cceval_python_only_prefix": load_dataset_from_path(f"{preprocessed_dir}/cceval_only_prefix-5.pkl"),
+            "repoeval_api_only_prefix": load_dataset_from_path(f"{preprocessed_dir}/repoeval_api_only_prefix-5.pkl")
+        }
+    elif args.real_case:
+        all_eval_examples = {
+            "real_case": load_dataset_from_path(f"{preprocessed_dir}/real_test_without_comment_one_line-5.pkl")
+        }
+    elif args.unixcoder:
+        preprocessed_dir = "preprocessed-unixcoder"
+        all_eval_examples = {
+            "repoeval_line": load_dataset_from_path(f"{preprocessed_dir}/repoeval_line-5.pkl"),
+            "repoeval_api": load_dataset_from_path(f"{preprocessed_dir}/repoeval_api-5.pkl"),
+            # "repoeval_func": load_dataset_from_path(f"{preprocessed_dir}/repoeval_func-5.pkl"),
+            "ours": load_dataset_from_path(f"{preprocessed_dir}/ours-5.pkl"),
+            "ours_suffix": load_dataset_from_path(f"{preprocessed_dir}/ours-suffix-5.pkl"),
+            "cceval_python": load_dataset_from_path(f"{preprocessed_dir}/cceval-5.pkl"),
+        }
+    else:
+        all_eval_examples = {
+            "repoeval_line": load_dataset_from_path(f"{preprocessed_dir}/repoeval_line-5.pkl"),
+            "repoeval_api": load_dataset_from_path(f"{preprocessed_dir}/repoeval_api-5.pkl"),
+            # "repoeval_func": load_dataset_from_path(f"{preprocessed_dir}/repoeval_func-5.pkl"),
+            "ours": load_dataset_from_path(f"{preprocessed_dir}/ours-5.pkl"),
+            "ours_suffix": load_dataset_from_path(f"{preprocessed_dir}/ours-suffix-5.pkl"),
+            # "ours_func": load_dataset_from_path(f"{preprocessed_dir}/ours-func-5.pkl"),
+            "cceval_python": load_dataset_from_path(f"{preprocessed_dir}/cceval-5.pkl"),
+        }
     
     with open(f"{args.output_dir}/retrieval.pkl", 'wb') as f:
         pickle.dump(all_eval_examples, f)

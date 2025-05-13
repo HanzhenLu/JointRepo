@@ -92,7 +92,3 @@ def eval_repoeval(file_path):
         "id_f1": '-',
         "total": total,
     }
-
-if __name__ == '__main__':
-    file_path = '/data2/hanzhenlu/JointRepo/test.jsonl'
-    print(eval_repoeval(file_path))
